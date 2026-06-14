@@ -747,7 +747,7 @@ class DataDrivenCompressor(BaseCompressor):
                 q_inputs = all_q_inputs[block_names[0]]
                 all_q_inputs.pop(block_names[0])
 
-            inputs, q_inputs = _update_inputs(inputs, q_inputs)
+            inputs, q_inputs = _update_inputs(inputs, q_inputs, self.model_context)
 
             clear_memory(self.inputs, device_list=self.compress_context.device_list)
 

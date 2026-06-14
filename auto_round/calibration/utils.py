@@ -40,11 +40,9 @@ def _infer_last_cache_name(block_names, layer_names=None, requested_last_cache_n
     return None
 
 
-def _update_inputs(inputs: dict, q_inputs: dict) -> tuple[dict, torch.Tensor]:
-    from auto_round.context.model import ModelContext
-
-    model_context = ModelContext()
-    if model_context.is_diffusion:
+def _update_inputs(inputs: dict, q_inputs: dict, model_context=None) -> tuple[dict, torch.Tensor]:
+    is_diffusion = getattr(model_context, 'is_diffusion', False) if model_context is not None else False
+    if is_diffusion:
         input_id_str = [key for key in inputs.keys() if "hidden_state" in key]
         if input_id_str == ["hidden_states"]:
             if q_inputs is not None:

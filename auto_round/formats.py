@@ -150,11 +150,10 @@ class OutputFormat(ABC):
         self.backend = None
 
         if not self.is_fake() and not self.is_support_scheme(ar.scheme):
-            logger.error(
+            raise ValueError(
                 f"Currently, the {self.format_name} format only supports {self.support_schemes}, "
                 f"but got scheme {ar.scheme}, please change to fake or auto_round etc."
             )
-            exit(-1)
 
     @classmethod
     def register(cls, *names: str) -> Callable[[OutputFormat], OutputFormat]:
@@ -220,8 +219,7 @@ class OutputFormat(ABC):
             )
             error_msg = ("act_data_type<fp8> " + error_msg) if act_fp8 else error_msg
             error_msg = ("data_type<fp8> " + error_msg) if w_fp8 else error_msg
-            logger.error(error_msg)
-            sys.exit(-1)
+            raise ValueError(error_msg)
 
         if ar.act_bits <= 8 and (not is_standard_fp(ar.act_data_type) or ar.act_dynamic):
             logger.warning(

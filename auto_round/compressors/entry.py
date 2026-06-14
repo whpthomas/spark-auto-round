@@ -23,7 +23,7 @@ def _preview_resolved_attrs(config, scheme=None) -> dict:
     scheme_attr_names = QuantizationScheme.get_attributes()
     user_overrides = {k: getattr(config, k) for k in scheme_attr_names if getattr(config, k, None) is not None}
     try:
-        _, _, final_attrs = _parse_scheme(scheme, user_overrides)
+        _, final_attrs = _parse_scheme(scheme, user_overrides)
         return final_attrs
     except Exception:
         return {}
@@ -34,7 +34,7 @@ def _eager_validate_scheme(config, scheme=None) -> None:
     scheme_attr_names = QuantizationScheme.get_attributes()
     user_overrides = {k: getattr(config, k) for k in scheme_attr_names if getattr(config, k, None) is not None}
     try:
-        _, _, final_attrs = _parse_scheme(scheme, user_overrides)
+        _, final_attrs = _parse_scheme(scheme, user_overrides)
     except (ValueError, NotImplementedError):
         raise
     except Exception:
@@ -97,6 +97,11 @@ def auto_round_factory(
     # Resolve string alias(es) to config instance(s) before routing.
     alg_configs = _resolve_config(alg_configs)
 
+    # When no config is provided, create a default SignRoundConfig.
+    if alg_configs is None:
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+        alg_configs = SignRoundConfig(iters=iters or 200)
+
     # Extract the single QuantizationConfig from a list; validate at most one exists.
     if isinstance(alg_configs, list):
         quant_configs = [c for c in alg_configs if isinstance(c, QuantizationConfig)]
@@ -133,11 +138,15 @@ def auto_round_factory(
         seqlen=seqlen,
     )
 
-    # Pop kwargs that are only consumed by specific Mixins
-    for _k in ("processor", "image_processor", "template", "extra_data_dir", "quant_nontext_module"):
+    # Pop kwargs that are only consumed by specific Mixins or are legacy/unused
+    for _k in (
+        "processor", "image_processor", "template", "extra_data_dir", "quant_nontext_module",
+        "disable_opt_rtn", "use_meta_device",
+        # Legacy kwargs from old API that are no longer used
+        "enable_adam", "extra_config", "not_use_best_mse", "momentum",
+        "rotation_config", "algorithm", "enable_alg_ext",
+    ):
         kwargs.pop(_k, None)
-    kwargs.pop("disable_opt_rtn", None)
-    kwargs.pop("use_meta_device", None)
 
     # Only SignRoundConfig is supported
     if not isinstance(quant_config, SignRoundConfig):

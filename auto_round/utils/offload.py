@@ -420,15 +420,13 @@ class OffloadManager:
             module = get_module(model, name)
             if module is None:
                 continue
-            # Estimate size based on state_dict (parameters + buffers), excluding meta tensors,
-            # to match what is actually written by the offload logic.
-            state_dict = module.state_dict()
-            for tensor in state_dict.values():
-                if not isinstance(tensor, torch.Tensor):
-                    continue
-                if tensor.is_meta or tensor.numel() == 0:
-                    continue
-                total_bytes += tensor.numel() * tensor.element_size()
+            # Estimate size directly from parameters (avoids state_dict copy overhead).
+            for param in module.parameters(recurse=True):
+                if param is not None and param.numel() > 0 and not param.is_meta:
+                    total_bytes += param.numel() * param.element_size()
+            for buf in module.buffers(recurse=True):
+                if buf is not None and buf.numel() > 0 and not buf.is_meta:
+                    total_bytes += buf.numel() * buf.element_size()
         # torch.save adds serialization overhead; use 1.2x safety margin
         required_bytes = int(total_bytes * 1.2)
         from auto_round import envs

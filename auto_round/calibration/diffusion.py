@@ -97,12 +97,11 @@ class DiffusionCalibrator(LLMCalibrator):
             and pipe.device != c.model.device
             and torch.device(c.model.device).type in ["cuda", "xpu"]
         ):
-            logger.error(
+            raise RuntimeError(
                 "Diffusion model is activated sequential model offloading, it will crash during moving to GPU/XPU. "
                 "Please use model path for quantization or "
                 "move the pipeline object to GPU/XPU before passing them into API."
             )
-            exit(-1)
 
         target_device = c.compress_context.device
         if pipe.device != torch.device(target_device):
@@ -154,11 +153,10 @@ class DiffusionCalibrator(LLMCalibrator):
                 if total_cnt >= nsamples:
                     break
         if total_cnt == 0:
-            logger.error(
+            raise ValueError(
                 f"no data has been cached, please provide more data with sequence length >={c.seqlen} in the "
                 f"dataset or decease the sequence length"
             )
-            exit(-1)
         elif total_cnt < nsamples:
             logger.warning(
                 f"Insufficient number of samples collected may affect the quantization. "

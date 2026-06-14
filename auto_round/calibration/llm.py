@@ -292,8 +292,7 @@ class LLMCalibrator(Calibrator):
                 data_new = input_ids
             elif isinstance(data, str):
                 if c.model_context.tokenizer is None:
-                    logger.error("please provide tokenizer for string input")
-                    exit(-1)
+                    raise ValueError("please provide tokenizer for string input")
                 data = c.model_context.tokenizer(data, truncation=True, max_length=c.seqlen, return_tensors="pt").data
                 data_new = {}
                 for key in data.keys():
@@ -391,11 +390,10 @@ class LLMCalibrator(Calibrator):
             if total_cnt >= nsamples:
                 break
         if total_cnt == 0:
-            logger.error(
+            raise ValueError(
                 f"no data has been cached, please provide more data with sequence length "
                 f">={c.seqlen} in the dataset or decease the sequence length"
             )
-            exit(-1)
         elif total_cnt < nsamples:
             logger.warning_once(
                 f"An insufficient number of samples likely reduces the accuracy of the quantized model. "

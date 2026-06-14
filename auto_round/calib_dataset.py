@@ -183,7 +183,7 @@ def get_pile_dataset(
             )
         else:
             logger.error(f"Failed to load the dataset: {error_message}")
-        sys.exit(1)
+        raise RuntimeError(f"Failed to load the dataset: {error_message}")
     calib_dataset = calib_dataset.shuffle(seed=seed)
     calib_dataset = calib_dataset.map(
         tokenizer_function,

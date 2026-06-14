@@ -70,13 +70,12 @@ def make_block_forward_func(state, name: str) -> Callable:
                 if hidden_states.shape[0] > state.quantizer.batch_size:
                     state.quantizer.batch_dim = 1
                     if len(hidden_states.shape) > 1 and hidden_states.shape[1] > state.quantizer.batch_size:
-                        logger.error(
+                        raise RuntimeError(
                             "this model has not been supported, "
                             "please raise an issue in https://github.com/intel/auto-round/issues"
                             " or try to set the `batch_size` to 1 and "
                             "`gradient_accumulate_steps` to your current batch size."
                         )
-                        exit(-1)
 
         if hidden_states is not None:
             kwargs["hidden_states"] = hidden_states

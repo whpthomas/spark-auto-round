@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "spark-auto-round"
@@ -20,7 +20,7 @@ dependencies = [
     "tqdm",
     "packaging",
     "psutil",
-    "cpuinfo",
+    "py-cpuinfo",
     "safetensors",
     "huggingface_hub",
     "pydantic",
@@ -35,6 +35,7 @@ test = [
 
 [project.scripts]
 spark-auto-round = "auto_round.__main__:run"
+spark-asqa-substitute = "auto_round.asqa.__main__:run"
 
 [tool.setuptools.dynamic]
 version = {attr = "auto_round.version.__version__"}

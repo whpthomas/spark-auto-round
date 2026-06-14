@@ -762,8 +762,7 @@ def _get_quantized_layer_names_outside_blocks(model, layer_config, supported_typ
             continue
         layer = get_module(model, key)
         if layer is None:
-            logger.error(f"could not find layer {key} in the model, exit...")
-            exit(-1)
+            raise ValueError(f"could not find layer {key} in the model")
         if type(layer) in supported_types and check_to_quantized(layer_config[key]):
             layer_names.append(key)
 

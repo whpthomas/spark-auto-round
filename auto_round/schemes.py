@@ -215,9 +215,11 @@ def _override_scheme_with_user_specify(
 
 def _parse_scheme(
     scheme: Union[str, dict, QuantizationScheme], user_scheme_overrides: dict[str, Any]
-) -> tuple[Union[str, QuantizationScheme], bool]:
-    """
-    Parses the final scheme.
+) -> tuple[Union[str, QuantizationScheme], dict[str, Any]]:
+    """Parses the final scheme.
+
+    Returns:
+        Tuple of (resolved_scheme, final_attrs_dict)
     """
     default_scheme = _override_scheme_with_user_specify(scheme, user_scheme_overrides)
 
@@ -227,7 +229,7 @@ def _parse_scheme(
         final_attrs = asdict(final_attrs)
     else:
         final_attrs = asdict(default_scheme)
-    return default_scheme, False, final_attrs
+    return default_scheme, final_attrs
 
 
 W4A16 = QuantizationScheme.from_dict(

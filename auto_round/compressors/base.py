@@ -358,7 +358,7 @@ class BaseCompressor(object):
             for k in scheme_fields
             if getattr(self.quantize_config, k, None) is not None
         }
-        default_scheme, _is_auto_scheme_unused, final_attrs = _parse_scheme(self.scheme, user_scheme_overrides)
+        default_scheme, final_attrs = _parse_scheme(self.scheme, user_scheme_overrides)
 
         for key, value in final_attrs.items():
             setattr(self.quantize_config, key, value)

@@ -70,6 +70,7 @@ class ModelContext(BaseContext):
         super().__init__()
         self.quantized = False
         self.is_mllm = False
+        self.is_diffusion = False
         self.is_model_patched = False
         self.is_moe_model = False
 
