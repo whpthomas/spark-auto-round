@@ -1,0 +1,16 @@
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Python bytecode
+__pycache__/
+
+# Test cache
+.pytest_cache/
+
+# Quantized model output (large, generated)
+models/
+compressed_models/
+
+thoughts/
