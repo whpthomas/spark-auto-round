@@ -12,20 +12,19 @@ uv pip install -e .          # editable install
 uv pip install pytest        # test runner (not in install_requires)
 ```
 
-Optional test extras live in `test/test_cuda/requirements.txt` (gptqmodel, lm_eval, sentencepiece, etc.).
+Optional test extras: `uv pip install gptqmodel lm_eval` or see `test/test_cuda/requirements.txt`.
 
 ## Key commands
 
 | Task | Command |
 |------|---------|
 | CLI entry point | `spark-auto-round <model> --output_dir ./models` |
-| Dry-run (validates setup) | `spark-auto-round <model> --dry-run` |
 | All tests (needs CUDA + HF models) | `pytest test/ -v` |
 | CUDA-specific tests only | `pytest test/test_cuda/ -v` |
 | Single test | `pytest test/test_cuda/quantization/test_asym.py::TestAutoRoundAsym::test_asym_group_size -v` |
 | Filter by keyword | `pytest -k "torch_compile" -v` |
 
-**No linting, typecheck, formatter, or CI workflows are configured.** There is no `pyproject.toml`, `Makefile`, or `.github/` directory.
+**No linting, typecheck, formatter, or CI workflows are configured.** There is no `Makefile`, `.github/` directory, or pre-commit hooks.
 
 ## Architecture
 
@@ -36,7 +35,7 @@ auto_round/              # Main package (installed as `spark_auto_round`)
 ├── autoround.py         # AutoRound facade — delegates to AutoRoundCompatible via __new__
 ├── schemes.py           # QuantizationScheme dataclass + W4A16 preset
 ├── formats.py           # OutputFormat (auto_round, fake)
-├── compressors/         # Core: entry.py (router), data_driven.py, zero_shot.py
+├── compressors/         # Core: entry.py (factory), data_driven.py, config.py (SARConfig)
 ├── algorithms/          # sign_round (SignSGD)
 ├── data_type/           # INT/FP quantization kernels
 ├── export/              # Export to auto_round format (export_to_autoround/)
@@ -69,8 +68,9 @@ test/
 - **`monkey_patch()` runs at import time** when you do `from auto_round import AutoRound`. This patches transformers internals. Don't import auto_round for side effects in test scaffolding.
 - **Only `auto_round:auto_gptq` (aka `auto_round`) output format** is actually supported. Don't try marlin, gguf, mlx, etc.
 - **Test fixtures download models from HuggingFace** (session-scoped). First run requires network access. Models are tiny (2-layer slices) and saved to `test/tmp/`.
-- **Default CLI recipe**: `--scheme W4A16`, `--iters 1000`, `--nsamples 512`, `--seqlen 2048`, `--batch_size 8`, `--dataset github-code-clean`. torch.compile is enabled by default.
-- **The `spark-auto-round` shortcut** (from setup.py entry_points) calls `auto_round.__main__:run`.
+- **Default CLI recipe**: `--iters 1000`, `--nsamples 512`, `--seqlen 2048`, `--batch_size 8`, `--dataset github-code-clean`. torch.compile is enabled by default. Scheme is hardcoded to W4A16.
+- **The `spark-auto-round` shortcut** (from pyproject.toml `[project.scripts]`) calls `auto_round.__main__:run`.
+- **Two build files exist** (`pyproject.toml` and `setup.py`) with slightly different dependency versions. `pyproject.toml` is canonical: Python >= 3.10, torch >= 2.4.
 
 ## CLI defaults
 
@@ -86,7 +86,6 @@ test/
 | `--dataset` | github-code-clean | Calibration dataset |
 | `--disable_torch_compile` | (disabled) | Disable torch.compile (enabled by default) |
 | `--memory_utilization` | 75 | Memory threshold (50-95). Models exceeding this trigger block-by-block offloading to disk. |
-| `--mllm` | false | Force multimodal mode (auto-detected by default). |
 
 Hardcoded values: device=cuda:0, format=auto_round, scheme=W4A16, platform=hf, scale_dtype=bf16, amp=True, minmax_tuning=True, norm_bias_tuning=False, quanted_input=True, not_use_best_mse=False.
 
@@ -105,9 +104,17 @@ Hardcoded values: device=cuda:0, format=auto_round, scheme=W4A16, platform=hf, s
 - **Top-level tests** (`test/test_*.py`): Pure Python, no GPU. CLI display, metrics, report.
 - **CUDA tests** (`test/test_cuda/`): Require CUDA GPU. Quantization, algorithms, packing.
 - **Fixtures**: Session-scoped, auto-download tiny model slices from HuggingFace. Saved to `test/tmp/`, cleaned up after session.
-- **`get_model_path()`**: Checks `/tf_dataset/auto_round/models/`, `/models/`, `/dataset/`, then falls back to HuggingFace name.
-- **Test README** at `test/README.md` has detailed fixture/usage docs.
+- **`get_model_path()`** (`test/helpers.py`): Checks `/tf_dataset/auto_round/models/`, `/models/`, `/dataset/`, then falls back to HuggingFace name.
 
 ## Codebase origin
 
 The cleanup from upstream auto-round is documented in `thoughts/01-lean-and-mean/design-brief.md` and the multi-phase pruning in `thoughts/02-prune/`. Consult them before re-enabling any upstream feature to understand what was changed and why. (Note: `thoughts/` is in `.gitignore`.)
+
+## Architecture details
+
+- **`SARConfig`** (`auto_round/compressors/config.py`): Flat dataclass replacing the old ExtraConfig/TuningExtraConfig/SchemeExtraConfig hierarchy. All tuning + scheme params live here.
+- **`auto_round_factory()`** (`auto_round/compressors/entry.py`): Factory function that creates the appropriate compressor. The `DataDrivenCompressor` is the main quantization workhorse.
+- **`compressors/`** is the core package: `entry.py` (factory/router), `data_driven.py` (quantization logic), `base.py` (base class).
+- **`auto_round_extension/`**: Low-level kernels. `cuda/` has Marlin/GPTQ kernels, `triton/` has Triton quantized linear layers, `torch/` has pure-torch fallback.
+- **Multimodal/MoE**: Handled by `auto_round/modeling/` and `auto_round/special_model_handler.py`. Model-specific logic for Gemma 4, Qwen, DeepSeek, etc.
+- **Export**: Only `auto_round:auto_gptq` format is supported. Export logic in `auto_round/export/export_to_autoround/`.

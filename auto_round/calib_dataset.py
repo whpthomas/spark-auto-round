@@ -689,8 +689,10 @@ def get_opencode_instruct_dataset(
     parquet_files = [f for f in files if f.endswith(".parquet") and f.startswith("data/")]
 
     # Sample random shards for diversity (4 shards ≈ 400K samples)
-    # After packing, ~25% become full-length sequences, so 2000 samples → ~500 packed sequences
-    target_samples = 2000
+    # After packing, ~25% become full-length sequences, so 2100 samples → ~540 packed sequences.
+    # We oversample slightly so that after the filter in _get_dataset_impl drops
+    # mostly-padding sequences, we still have >= nsamples (512) valid sequences.
+    target_samples = 2100
     num_shards = min(4, len(parquet_files))
     random.seed(seed)
     selected_shards = random.sample(parquet_files, min(num_shards, len(parquet_files)))

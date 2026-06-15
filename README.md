@@ -6,7 +6,7 @@
 ![CUDA](https://img.shields.io/badge/CUDA-required-orange)
 ![GB10](https://img.shields.io/badge/hardware-GB10-purple)
 
-> Your best Int4 AutoRound quantization for GB10 hardware
+> Int4 AutoRound quantization for GB10 hardware
 
 ## What is this?
 
@@ -29,22 +29,6 @@ To run comparative benchmarks and compare and contrast quantized models we need 
 - **Simple CLI**: Easy-to-use command-line interface i.e. `spark-auto-round <model>`
 - **GB10 Optimized**: Whole-model quantization with 128GB unified memory, or automatic fallback to block-by-block loading for large models that don't fit in memory
 - **torch.compile**: Always enabled for faster quantization on CUDA
-
-## Iterative Optimization
-
-The dense *Qwen 3.5 0.8B* model was used as a testbed to optimize Spark AutoRound (SAR). Using this [test setup and methodology](OPTIMIZATION.md) we achieved Tool Eval Bench score parity with the unquantized bf16 model.
-
-| # | Model | Scheme | Dataset | Score | Rating | P/F | Tokens | Runs |
-|---|-------|--------|---------|-------|--------|-----|--------|------|
-|🥇 | **qwen3.5-0.8b-sar** | **Int4** | OpenCode Instruct | **69** | ★★★  | 41/13/15 | 516K | 3 |
-|🥈 | qwen3.5-0.8b-sar | Int4 | github-code-clean | 67 | ★★★  | 39/14/16 | 516K | 3 |
-|🥉 | **qwen3.5-0.8b** | **bf16** | - | **67** | ★★★  | 40/13/16 | 571K | 3 |
-| 4 | qwen3.5-0.8b-ar | Int4 | pile-10k | 62 | ★★★ⓢ | 37/11/21 | 486K | 4 |
-| 5 | qwen3.5-0.8b-sar | Int4 | pile-10k | 62 | ★★★  | 37/11/21 | 537K | 11 |
-
-*`-sar` Spark AutoRound, `-ar` Intel AutoRound*
-
-These results should **NOT** be interpreted to mean that SAR quantized models are equivalent bf16. It only demonstrates that for one 0.8B model, optimal settings were found that achieved test score parity with the original bf16 model. While these results are encouraging, whether these optimal settings generalize to other models requires further research and is under active investigation.
 
 ## Installation
 
@@ -69,6 +53,76 @@ spark-auto-round <model> --output_dir ./models
 ```
 
 The quantized model is saved to `{output_dir}/{model}-int4-AutoRound` by default. For example, quantizing `Qwen/Qwen3.6-27B` with `--output_dir ./models` produces `./models/Qwen3.6-27B-int4-AutoRound/`.
+
+## Performance with Qwen 3.6 27b
+
+Spark auto round achieves a [92/100 tool-eval-bench](docs/test-score.md) with the Nvidia's OpenCode Instruct dataset.
+
+- `spark-auto-round --dataset "opencode-instruct" Qwen/Qwen3.6-27B`
+- MTP 3 averages ~24 t/s for long context and agentic coding
+
+| Model | Scheme | Dataset | Score | Rating | P/F | Tokens | Runs |
+|-------|--------|---------|-------|--------|-----|--------|------|
+| **qwen3.6-27b-sar** | **Int4** | OpenCode Instruct | **92** | ★★★★★ | 59/9/1 | 284K | 9 |
+
+```bash
+#!/bin/bash
+
+docker run -it --name vllm-qwen36 \
+    --gpus all --net=host --ipc=host \
+    -v ~/models:/models \
+    -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+    -e TORCH_MATMUL_PRECISION=high \
+    -e NVIDIA_FORWARD_COMPAT=1 \
+    -e NVIDIA_DISABLE_REQUIRE=1 \
+    -e HF_HUB_OFFLINE=1 \
+    -e TRANSFORMERS_OFFLINE=1 \
+    vllm-node-tf5 \
+    bash -c -i "vllm serve /models/Qwen3.6-27B-int4-AutoRound \
+    --served-model-name qwen/qwen3.6-27b-sar \
+    --port 8000 \
+    --host 0.0.0.0 \
+    --gpu-memory-utilization 0.60 \
+    --max-model-len 192K \
+    --max-num-batched-tokens 32768 \
+    --max-num-seqs 16 \
+    --load-format fastsafetensors \
+    --dtype auto \
+    --quantization modelopt \
+    --kv-cache-dtype auto \
+    --generation-config auto \
+    --enable-chunked-prefill \
+    --no-enable-prefix-caching \
+    --override-generation-config '{\"temperature\": 0.7}' \
+    --attention-backend flash_attn \
+    --limit-mm-per-prompt '{\"image\": 4, \"video\": 2}' \
+    --mm-encoder-tp-mode data \
+    --mm-processor-cache-type shm \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --chat-template /models/qwen3.6-enhanced.jinja \
+    --reasoning-parser qwen3 \
+    --speculative-config '{\"method\": \"qwen3_next_mtp\", \"num_speculative_tokens\": 3}'"
+#    --speculative-config '{\"method\": \"dflash\", \"model\": \"/models/Qwen3.6-27B-DFlash\", \"num_speculative_tokens\": 10}'"
+
+docker container remove vllm-qwen36
+```
+
+## Iterative Optimization with Qwen 3.5 0.8b
+
+The dense *Qwen 3.5 0.8B* model was used as a testbed to optimize Spark AutoRound (SAR). Using this [test setup and methodology](docs/optimization.md) we achieved Tool Eval Bench score parity with the unquantized bf16 model.
+
+| # | Model | Scheme | Dataset | Score | Rating | P/F | Tokens | Runs |
+|---|-------|--------|---------|-------|--------|-----|--------|------|
+|🥇 | **qwen3.5-0.8b-sar** | **Int4** | OpenCode Instruct | **69** | ★★★  | 41/13/15 | 516K | 3 |
+|🥈 | qwen3.5-0.8b-sar | Int4 | github-code-clean | 67 | ★★★  | 39/14/16 | 516K | 3 |
+|🥉 | **qwen3.5-0.8b** | **bf16** | - | **67** | ★★★  | 40/13/16 | 571K | 3 |
+| 4 | qwen3.5-0.8b-ar | Int4 | pile-10k | 62 | ★★★ⓢ | 37/11/21 | 486K | 4 |
+| 5 | qwen3.5-0.8b-sar | Int4 | pile-10k | 62 | ★★★  | 37/11/21 | 537K | 11 |
+
+*`-sar` Spark AutoRound, `-ar` Intel AutoRound*
+
+These results should **NOT** be interpreted to mean that SAR quantized models are equivalent bf16. It only demonstrates that for one 0.8B model, optimal settings were found that achieved test score parity with the original bf16 model. While these results are encouraging, whether these optimal settings generalize to other models requires further research and is under active investigation.
 
 ### Examples
 

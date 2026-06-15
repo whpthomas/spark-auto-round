@@ -1187,6 +1187,7 @@ def revert_checkpoint_conversion_mapping(name: str, key_mapping: dict[str, str])
         for target_pattern in target_patterns:
             source_pattern = source_pattern.lstrip("^")  # strip off un-needed chars and patterns
             source_pattern = re.sub(r"\(.*\)", "", source_pattern)
+            target_pattern = re.sub(r"\\\d+", "", target_pattern)  # strip backrefs (\1, \2) matching removed groups
             name, n_replace = re.subn(source_pattern, target_pattern, name)
             # Early exit of the loop
             if n_replace > 0:

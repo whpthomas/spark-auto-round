@@ -167,9 +167,7 @@ class QuantizationReport:
         """Format a loss value for display."""
         if value == 0:
             return "0"
-        if value < 0.001:
-            return f"{value:.2e}"
-        return f"{value:.6f}"
+        return f"{value:.4f}"
 
     def _format_report(self) -> list[str]:
         """Build the full report as a list of lines."""

@@ -212,6 +212,15 @@ class CLIDisplay:
 
     # ── Internal ────────────────────────────────────────────────────────
 
+    def _make_bar(self, prefix, suffix) -> str:
+        """Create a progress bar string with adaptive width."""
+        terminal_width = shutil.get_terminal_size().columns
+        fixed_overhead = len(prefix) + len(suffix)
+        bar_width = max(10, terminal_width - fixed_overhead)
+        filled = int(bar_width * self._blocks_done / self._total_blocks) if self._total_blocks > 0 else 0
+        bar = "█" * filled + "░" * (bar_width - filled)
+        return f"{prefix}{bar}{suffix}"
+
     def _print_progress(self, next_block_name: str) -> None:
         """Print the progress bar line.
 
@@ -222,8 +231,6 @@ class CLIDisplay:
         idx = self._blocks_done
         pct = int(idx / total * 100) if total > 0 else 0
 
-        # Adaptive bar width
-        terminal_width = shutil.get_terminal_size().columns
         # Elapsed time
         elapsed = time.time() - self._start_time if self._start_time else 0
         if idx > 0:
@@ -238,12 +245,7 @@ class CLIDisplay:
         # Reserve space for: "Quantizing {name}: {pct}%|{bar}|{idx}/{total} [elapsed<remaining, rate]"
         prefix = f"Quantizing {next_block_name}:{pct:3d}%|"
         suffix = f"|{idx}/{total} {time_info}"
-        fixed_overhead = len(prefix) + len(suffix)
-        bar_width = max(10, terminal_width - fixed_overhead)
-        filled = int(bar_width * idx / total) if total > 0 else 0
-        bar = "█" * filled + "░" * (bar_width - filled)
-
-        line = f"{prefix}{bar}{suffix}"
+        line = self._make_bar(prefix, suffix)
 
         if Colors.ENABLED:
             sys.stdout.write(line + _NEW_LINE)
@@ -255,9 +257,9 @@ class CLIDisplay:
 
     def _print_done(self) -> None:
         """Print the 'done' progress bar."""
-        total = self._total_blocks
-        bar = "█" * 20
-        line = f"Quantizing done: 100%|{bar}|{total}/{total}"
+        prefix = "Quantizing done: 100%|"
+        suffix = f"|{self._total_blocks}/{self._total_blocks}"
+        line = self._make_bar(prefix, suffix)
 
         if Colors.ENABLED:
             sys.stdout.write(line + _NEW_LINE)
