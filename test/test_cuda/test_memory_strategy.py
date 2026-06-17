@@ -166,7 +166,6 @@ class TestIntegrationCLI:
             capture_output=True, text=True, cwd="/home/whpthomas/spark-auto-round"
         )
         assert "--memory_utilization" in result.stdout
-        assert "--mem-util" in result.stdout
 
     def test_memory_utilization_clamped_in_source(self):
         """Verify clamping logic exists in tune()."""

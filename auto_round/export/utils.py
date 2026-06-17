@@ -214,9 +214,17 @@ def resolve_pipeline_export_layout(model: nn.Module, output_dir: str) -> tuple[s
 # Some transformers configs use specialized model_type/architecture values
 # that vLLM doesn't recognize. We normalize these to the base forms.
 _CONFIG_NORMALIZATIONS = {
+    "qwen3_5": {
+        "model_type": "qwen3_5",
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+    },
     "qwen3_5_text": {
         "model_type": "qwen3_5",
         "architectures": ["Qwen3_5ForConditionalGeneration"],
+    },
+    "qwen3_5_moe": {
+        "model_type": "qwen3_5_moe",
+        "architectures": ["Qwen3_5MoeForConditionalGeneration"],
     },
     "qwen3_5_moe_text": {
         "model_type": "qwen3_5_moe",

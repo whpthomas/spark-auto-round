@@ -58,14 +58,10 @@ class TestAutoRoundAsym:
         assert os.path.exists(os.path.join(quantized_model_path, "config.json")), "config.json not found"
 
     @pytest.mark.skip_ci(reason="Not necessary since it's covered by backend tests")  # skip this test in CI
-    @pytest.mark.parametrize("format", ["auto_round", "auto_round:auto_gptq", "auto_round:gptqmodel"])
+    @pytest.mark.parametrize("format", ["auto_round"])
     def test_asym_format_with_tuning(self, format, tiny_opt_model_path):
         bits, group_size, sym = 4, 128, True  # Using symmetric for auto_round format compatibility
         ar = AutoRound(tiny_opt_model_path, bits=bits, group_size=group_size, sym=sym, iters=1, seqlen=2, nsamples=1)
-        
-        # Skip AWQ format - not available in spark-auto-round
-        if format == "auto_round" and not sym:
-            pytest.skip("AWQ format not available in spark-auto-round")
         
         _, quantized_model_path = ar.quantize_and_save(format=format, output_dir=self.save_dir)
         

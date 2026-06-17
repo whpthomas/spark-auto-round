@@ -352,6 +352,18 @@ def save_quantized_as_autoround(
 
     if processor is not None:
         processor.save_pretrained(processor_output_dir)
+
+        # Ensure processor_class is preserved in tokenizer_config.json
+        tokenizer_config_path = os.path.join(processor_output_dir, "tokenizer_config.json")
+        if os.path.exists(tokenizer_config_path):
+            with open(tokenizer_config_path, "r", encoding="utf-8") as f:
+                tok_config = json.load(f)
+            if "processor_class" not in tok_config or tok_config["processor_class"] is None:
+                tok_config["processor_class"] = type(processor).__name__
+                with open(tokenizer_config_path, "w", encoding="utf-8") as f:
+                    json.dump(tok_config, f, indent=2)
+                logger.debug(f"Added processor_class={type(processor).__name__} to tokenizer_config.json")
+
     if image_processor is not None:
         image_processor.save_pretrained(processor_output_dir)
     if quantization_config.get("act_bits", 16) <= 8:

@@ -49,6 +49,8 @@ SUPPORT_ONLY_TEXT_MODELS = [
     "qwen3_vl_moe",
     "qwen2_5_omni",
     "qwen3_omni_moe",
+    "qwen3_5",
+    "qwen3_5_moe",
     "gemma3",
     "bagel",
     "mimo_audio",
