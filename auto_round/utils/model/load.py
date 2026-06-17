@@ -152,7 +152,8 @@ _EXTRA_MODEL_FILES = {
     "spk_dict.pt",  # Qwen2.5-Omni speaker dictionary for audio output
     "llm_config.json",  # BAGEL sub-model config
     "vit_config.json",  # BAGEL vision transformer config
-    "preprocessor_config.json",  # BAGEL image preprocessor config
+    "preprocessor_config.json",  # BAGEL / Qwen VL image preprocessor config
+    "processor_config.json",  # Qwen VL processor config (image + video processors)
 }
 
 
