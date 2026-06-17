@@ -1,0 +1,66 @@
+# Recipe: Qwen3.5-0.8B-int4-AutoRound
+# Qwen3.6-122B model in FP8 quantization + DFlash
+
+recipe_version: "1"
+name: Qwen3.5-0.8B-int4-AutoRound
+description: vLLM serving Qwen3.5-0.8B-int4-AutoRound
+
+# No HF download needed - model is already local
+# model: null (or omit entirely)
+
+solo_only: true
+
+# Container image to use
+container: vllm-node-tf5
+
+build_args:
+  - --tf5
+
+mods:
+  - mods/fix-qwen3.5-enhanced-chat-template
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  max_model_len: 128K
+  gpu_memory_utilization: 0.60
+  max_num_batched_tokens: 32768
+  max-num-seqs: 4
+  served_model_name: qwen/qwen3.5-0.8b-sar-oc
+  generation_config: '{"temperature": 0.7}'
+
+# Environment variables
+env:
+  TORCH_MATMUL_PRECISION: high
+  NVIDIA_FORWARD_COMPAT: '1'
+  NVIDIA_DISABLE_REQUIRE: '1'
+  CUDA_DEVICE_MAX_CONNECTIONS: '1'
+  VLLM_MARLIN_USE_ATOMIC_ADD: '1'
+  VLLM_AUTO_ROUND_BACKEND: gptq_marlin 
+  FLASHINFER_DISABLE_VERSION_CHECK: 1
+  CUTE_DSL_ARCH: sm_121a
+
+# The vLLM serve command template
+command: |
+  vllm serve /models/Qwen3.5-0.8B-int4-AutoRound-oc \
+  --served-model-name {served_model_name} \
+  --max-model-len {max_model_len} \
+  --gpu-memory-utilization {gpu_memory_utilization} \
+  --max-num-batched-tokens {max_num_batched_tokens} \
+  --max-num-seqs {max-num-seqs} \
+  --optimization-level 3 \
+  --performance-mode throughput \
+  --port {port} \
+  --host {host} \
+  --load-format fastsafetensors \
+  --attention-backend flash_attn \
+  --no-enable-prefix-caching \
+  --enable-chunked-prefill \
+  --default-chat-template-kwargs '{{"preserve_thinking":true}}' \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 \
+  --generation-config auto \
+  --override-generation-config '{generation_config}' \
+  --chat-template qwen3.5-enhanced.jinja
