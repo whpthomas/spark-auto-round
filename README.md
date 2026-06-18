@@ -1,6 +1,6 @@
 # spark-auto-round
 
-![Version](https://img.shields.io/badge/version-0.14.1-blue)
+![Version](https://img.shields.io/badge/version-0.14.2-blue)
 ![License](https://img.shields.io/badge/license-Apache%202.0-green)
 ![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue)
 ![CUDA](https://img.shields.io/badge/CUDA-required-orange)

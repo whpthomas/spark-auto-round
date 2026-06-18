@@ -29,9 +29,11 @@ from auto_round.special_model_handler import _handle_special_model, update_modul
 from auto_round.utils import (
     CpuInfo,
     check_and_mark_quantized_module,
+    is_mllm_model,
     is_moe_model,
     is_moe_model_via_config,
     llm_load_model,
+    mllm_load_model,
     unsupported_meta_device,
 )
 from auto_round.utils.device import _force_trim_malloc
@@ -166,13 +168,26 @@ class ModelContext(BaseContext):
             # cpu otherwise.
             load_device = "meta" if self._use_meta_device else "cpu"
 
-            self.model, self.tokenizer = llm_load_model(
-                self.model,
-                platform=self.platform,
-                device=load_device,
-                model_dtype=self.model_dtype,
-                trust_remote_code=self.trust_remote_code,
-            )
+            # Detect multimodal models (Qwen3.5, etc.) — must use mllm_load_model
+            # which loads the correct architecture class (e.g. Qwen3_5ForConditionalGeneration)
+            # to preserve nested model structure (model.language_model.layers.X).
+            if is_mllm_model(self.model, platform=self.platform):
+                self.is_mllm = True
+                self.model, self.processor, self.tokenizer, self.image_processor = mllm_load_model(
+                    self.model,
+                    platform=self.platform,
+                    device=load_device,
+                    model_dtype=self.model_dtype,
+                    trust_remote_code=self.trust_remote_code,
+                )
+            else:
+                self.model, self.tokenizer = llm_load_model(
+                    self.model,
+                    platform=self.platform,
+                    device=load_device,
+                    model_dtype=self.model_dtype,
+                    trust_remote_code=self.trust_remote_code,
+                )
         elif self.tokenizer is None and self.need_calib:
             raise ValueError("A tokenizer must be set for non-str model input")
 

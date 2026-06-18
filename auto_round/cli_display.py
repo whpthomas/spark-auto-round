@@ -167,7 +167,7 @@ class CLIDisplay:
         """Format a loss value for display."""
         if value == 0:
             return "0"
-        return f"{value*1000000:.2f}"
+        return f"{value*1000000:.0f}"
 
     def update_progress(self, block_name: str) -> None:
         """Update the progress bar description (for compatibility).

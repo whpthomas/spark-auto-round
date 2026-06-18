@@ -72,24 +72,40 @@ class TestDryRunParameterThreading:
             "BaseCompressor.__init__ should store dry_run as self.dry_run"
         )
 
-    def test_save_config_dry_run_method_exists(self):
-        """_save_config_dry_run method should exist on BaseCompressor."""
+    def test_save_config_dry_run_method_removed(self):
+        """_save_config_dry_run method should NOT exist on BaseCompressor."""
         from auto_round.compressors.base import BaseCompressor
 
-        assert hasattr(BaseCompressor, "_save_config_dry_run"), (
-            "BaseCompressor should have _save_config_dry_run method"
+        assert not hasattr(BaseCompressor, "_save_config_dry_run"), (
+            "_save_config_dry_run should be removed; dry-run uses shared code path"
         )
 
-    def test_quantize_and_save_checks_dry_run(self):
-        """quantize_and_save should check self.dry_run."""
+    def test_remove_stale_weights_removed(self):
+        """_remove_stale_weights should NOT exist on BaseCompressor."""
+        from auto_round.compressors.base import BaseCompressor
+
+        assert not hasattr(BaseCompressor, "_remove_stale_weights"), (
+            "_remove_stale_weights should be removed; not needed for dry-run"
+        )
+
+    def test_discover_mtp_layers_still_exists(self):
+        """_discover_mtp_layers method should still exist on BaseCompressor."""
+        from auto_round.compressors.base import BaseCompressor
+
+        assert hasattr(BaseCompressor, "_discover_mtp_layers"), (
+            "_discover_mtp_layers should still exist for MTP block discovery"
+        )
+
+    def test_quantize_and_save_dry_run_branch(self):
+        """quantize_and_save should have dry-run branch without _save_config_dry_run."""
         import auto_round.compressors.base as base_mod
 
         source = inspect.getsource(base_mod.BaseCompressor.quantize_and_save)
         assert "self.dry_run" in source, (
             "quantize_and_save should check self.dry_run"
         )
-        assert "_save_config_dry_run" in source, (
-            "quantize_and_save should call _save_config_dry_run when dry_run is True"
+        assert "_save_config_dry_run" not in source, (
+            "quantize_and_save should NOT call _save_config_dry_run"
         )
 
 

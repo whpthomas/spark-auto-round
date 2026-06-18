@@ -18,6 +18,51 @@ from auto_round.logger import logger
 from auto_round.schemes import QuantizationScheme, _parse_scheme
 
 
+# Compressor-class registry
+# ---------------------------------------------------------------------------
+# Maps (model_type, base_class_name) -> combined class, created lazily.
+_COMPRESSOR_REGISTRY: dict[tuple[str, str], type] = {}
+
+
+def _get_compressor_class(model) -> type:
+    """Return the compressor class, applying MLLM mixin for multimodal models.
+
+    For plain LLM models, returns ``DataDrivenCompressor`` unchanged.
+    For MLLM models, dynamically creates a combined class with ``MLLMMixin``
+    prepended so that ``_get_calibrator_kind()`` returns ``"mllm"``.
+    """
+    from auto_round.utils.model.detect import is_mllm_model
+
+    base_cls = DataDrivenCompressor
+
+    # Guard: only attempt MLLM detection for string paths or nn.Module instances
+    is_mllm = False
+    try:
+        if isinstance(model, str):
+            is_mllm = is_mllm_model(model)
+        elif hasattr(model, "config"):  # nn.Module with config attr
+            is_mllm = is_mllm_model(model)
+    except Exception:
+        # Detection failed (e.g. path not found, no network); assume non-MLLM
+        pass
+
+    key = ("mllm" if is_mllm else "llm", base_cls.__name__)
+
+    if key in _COMPRESSOR_REGISTRY:
+        return _COMPRESSOR_REGISTRY[key]
+
+    if key[0] == "mllm":
+        from auto_round.compressors.mllm_mixin import MLLMMixin
+
+        combined = type(f"Mllm{base_cls.__name__}", (MLLMMixin, base_cls), {})
+        _COMPRESSOR_REGISTRY[key] = combined
+        return combined
+
+    # Cache the plain LLM class too
+    _COMPRESSOR_REGISTRY[key] = base_cls
+    return base_cls
+
+
 def _preview_resolved_attrs(config, scheme=None) -> dict:
     """Resolve scheme attributes without mutating config, for routing decisions."""
     scheme_attr_names = QuantizationScheme.get_attributes()
@@ -141,8 +186,8 @@ def auto_round_factory(
     )
 
     # Pop kwargs that are only consumed by specific Mixins or are legacy/unused
+    # (MLLM kwargs are preserved below and forwarded to the combined class)
     for _k in (
-        "processor", "image_processor", "template", "extra_data_dir", "quant_nontext_module",
         "disable_opt_rtn", "use_meta_device",
         # Legacy kwargs from old API that are no longer used
         "enable_adam", "extra_config", "not_use_best_mse", "momentum",
@@ -157,7 +202,17 @@ def auto_round_factory(
             f"RTN and AWQ algorithms have been removed."
         )
 
-    return DataDrivenCompressor(alg_configs, **local_args, **kwargs)
+    # Select compressor class: DataDrivenCompressor for LLM, MLLM-mixed for multimodal
+    compressor_cls = _get_compressor_class(model)
+
+    # Forward MLLM-specific kwargs if the mixin is active
+    mllm_kwargs = {}
+    if issubclass(compressor_cls, type) and compressor_cls.__name__.startswith("Mllm"):
+        for _k in ("processor", "image_processor", "template", "extra_data_dir", "quant_nontext_module"):
+            if _k in kwargs:
+                mllm_kwargs[_k] = kwargs.pop(_k)
+
+    return compressor_cls(alg_configs, **local_args, **mllm_kwargs, **kwargs)
 
 
 def _pop_config_kwargs(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:

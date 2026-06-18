@@ -249,19 +249,55 @@ def _normalize_config_for_vllm(save_dir: str) -> None:
         data = json.load(f)
 
     original_mt = data.get("model_type")
+    changed = []
+
+    # Normalize model_type and architectures
     if original_mt in _CONFIG_NORMALIZATIONS:
         fixes = _CONFIG_NORMALIZATIONS[original_mt]
-        changed = []
         if data.get("model_type") != fixes["model_type"]:
             data["model_type"] = fixes["model_type"]
             changed.append(f"model_type: '{original_mt}' -> '{fixes['model_type']}'")
         if data.get("architectures") != fixes["architectures"]:
             data["architectures"] = fixes["architectures"]
             changed.append(f"architectures: {fixes['architectures']}")
-        if changed:
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            logger.info(f"Normalized config.json for vLLM compatibility: {'; '.join(changed)}")
+
+    # Validate MLLM config structure — warn if critical fields are missing
+    if original_mt in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"):
+        if "text_config" not in data and "hidden_size" in data:
+            logger.warning(
+                "MLLM config missing 'text_config' block — this may cause vLLM loading issues. "
+                "The config should have been preserved from the original model."
+            )
+        if "vision_config" not in data:
+            logger.warning(
+                "MLLM config missing 'vision_config' block — this may cause vLLM loading issues."
+            )
+        if "image_token_id" not in data:
+            logger.warning(
+                "MLLM config missing 'image_token_id' — this may cause vLLM loading issues."
+            )
+
+    if changed:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        logger.info(f"Normalized config.json for vLLM compatibility: {'; '.join(changed)}")
+
+
+def _copy_processor_config(source_dir: str, save_dir: str) -> None:
+    """Copy processor_config.json from source model to output directory.
+
+    This file is needed for MLLM models to properly initialize processors
+    in vLLM and other inference frameworks.
+    """
+    processor_config_src = os.path.join(source_dir, "processor_config.json")
+    processor_config_dst = os.path.join(save_dir, "processor_config.json")
+
+    if os.path.exists(processor_config_src) and not os.path.exists(processor_config_dst):
+        try:
+            shutil.copy2(processor_config_src, processor_config_dst)
+            logger.debug("Copied processor_config.json from %s to %s", source_dir, save_dir)
+        except Exception as e:
+            logger.warning("Failed to copy processor_config.json: %s", e)
 
 
 def save_model(
@@ -341,16 +377,28 @@ def save_model(
     # Normalize config for vLLM compatibility (e.g. qwen3_5_text -> qwen3_5)
     _normalize_config_for_vllm(save_dir)
 
-    config_file = "quantization_config.json"
-    if hasattr(model, "config") and hasattr(model.config, "quantization_config"):
-        with open(os.path.join(save_dir, config_file), "w", encoding="utf-8") as f:
-            json.dump(model.config.quantization_config, f, indent=2)
+    # NOTE: We intentionally do NOT write a separate quantization_config.json file.
+    # The quantization_config is embedded in config.json, which is the standard format
+    # used by upstream auto-round and expected by vLLM.
+    # If a quantization_config.json already exists from a previous run, remove it.
+    quantization_config_path = os.path.join(save_dir, "quantization_config.json")
+    if os.path.exists(quantization_config_path):
+        try:
+            os.remove(quantization_config_path)
+            logger.debug("Removed redundant quantization_config.json")
+        except Exception as e:
+            logger.warning("Failed to remove quantization_config.json: %s", e)
 
     try:
         if source_dir is not None:
             copy_python_files_from_model_cache(model, save_dir)
     except Exception as e:
         logger.warning("Skipping source model Python file copy due to error: %s", e)
+
+    # Copy processor_config.json from source model if it exists
+    # This file is needed for MLLM models to properly initialize processors
+    if source_dir is not None:
+        _copy_processor_config(source_dir, save_dir)
 
 
 def get_autogptq_packing_qlinear(backend, bits=4, group_size=128, sym=False):
@@ -409,6 +457,19 @@ def filter_quantization_config(quantization_config):
         quantization_config.pop("act_dynamic", None)
         quantization_config.pop("act_sym", None)
         quantization_config.pop("act_group_size", None)
+
+    # Also clean act_bits from per-layer extra_config entries
+    if "extra_config" in quantization_config:
+        extra_config = quantization_config["extra_config"]
+        for layer_name in list(extra_config.keys()):
+            layer_cfg = extra_config[layer_name]
+            if isinstance(layer_cfg, dict):
+                # Remove act_bits and related keys from per-layer config
+                for act_key in ["act_bits", "act_data_type", "act_dynamic", "act_sym", "act_group_size"]:
+                    layer_cfg.pop(act_key, None)
+                # Remove empty layer configs
+                if not layer_cfg:
+                    del extra_config[layer_name]
 
     clean_list = ("supported_types", "quant_block_list", "rotation_configs")
     for key in list(quantization_config.keys()):

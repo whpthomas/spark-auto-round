@@ -13,6 +13,7 @@
 # limitations under the License.
 import copy
 import gc
+import json
 import os
 import sys
 from dataclasses import asdict, dataclass, fields
@@ -564,6 +565,21 @@ class BaseCompressor(object):
         _force_trim_malloc()
 
         self._hardware_setup()
+
+        # Enable memory-efficient quantization for large MLLM models
+        if self.model_context.is_mllm:
+            if torch.cuda.device_count() > 1:
+                # Use gradient checkpointing to reduce memory
+                if hasattr(self.model_context.model, 'gradient_checkpointing_enable'):
+                    try:
+                        self.model_context.model.gradient_checkpointing_enable()
+                        logger.info("Enabled gradient checkpointing for multi-GPU MLLM quantization")
+                    except Exception as e:
+                        logger.debug(f"Could not enable gradient checkpointing: {e}")
+
+            # Clear cache between operations
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Final trim after all init phases.
         gc.collect()
@@ -1371,7 +1387,40 @@ class BaseCompressor(object):
         # ── DRY-RUN: write config files only, skip quantization and weight saving ──
         if self.dry_run:
             logger.info("Dry-run mode: skipping quantization, writing config files only.")
-            self._save_config_dry_run(output_dir, **kwargs)
+
+            # Build quantization config using the SAME code path as save_quantized()
+            quantization_config = self._build_quantization_config(
+                backend=kwargs.get("backend", "auto_round:auto_gptq")
+            )
+
+            # Discover MTP layers from source checkpoint
+            self._discover_mtp_layers(quantization_config)
+
+            # Set config on model (same as save_quantized_as_autoround does)
+            model = self.model_context.model
+            if hasattr(model, "config"):
+                model.config.quantization_config = quantization_config
+
+            # Write config.json (model.config.to_dict() includes quantization_config)
+            os.makedirs(output_dir, exist_ok=True)
+            config_path = os.path.join(output_dir, "config.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(model.config.to_dict(), f, indent=2, default=str)
+            logger.info(f"[dry-run] Wrote {config_path}")
+
+            # Write quantization_config.json (standalone copy)
+            qconfig_path = os.path.join(output_dir, "quantization_config.json")
+            with open(qconfig_path, "w", encoding="utf-8") as f:
+                json.dump(quantization_config, f, indent=2, default=str)
+            logger.info(f"[dry-run] Wrote {qconfig_path}")
+
+            # Save tokenizer files
+            tokenizer = self.model_context.tokenizer
+            if tokenizer is not None:
+                tokenizer.save_pretrained(output_dir)
+                logger.info(f"[dry-run] Saved tokenizer to {output_dir}")
+
+            logger.info("[dry-run] DRY-RUN COMPLETE: config files written, no weights saved")
             return self.model, output_dir
 
         if self.static_attention_dtype is not None:
@@ -1391,65 +1440,6 @@ class BaseCompressor(object):
         return model, folders
 
     # ── Dry-run helpers ───────────────────────────────────────────────────────
-
-    def _save_config_dry_run(self, output_dir: str, **kwargs) -> None:
-        """Write config files only — no quantization, no weight saving.
-
-        Exercises the same serialization-dict and export-config code paths as
-        ``save_quantized()`` + ``save_quantized_as_autoround()``, but skips
-        weight packing, safetensors writing, and quantization-report creation.
-        """
-        import json
-
-        os.makedirs(output_dir, exist_ok=True)
-
-        logger.info("=" * 60)
-        logger.info("[dry-run] DRY-RUN MODE: building config files only")
-        logger.info("=" * 60)
-
-        # Build the quantization config using the shared helper
-        quantization_config = self._build_quantization_config(
-            backend=kwargs.get("backend", "auto_round:auto_gptq")
-        )
-
-        # Discover MTP layers from source checkpoint (mirrors copy_missing_tensors_from_source logic)
-        self._discover_mtp_layers(quantization_config)
-
-        logger.info(
-            f"[dry-run] quantization_config built:\n"
-            f"  block_name_to_quantize = {quantization_config.get('block_name_to_quantize')!r}\n"
-            f"  quant_method = {quantization_config.get('quant_method')!r}\n"
-            f"  packing_format = {quantization_config.get('packing_format')!r}\n"
-            f"  has extra_config = {'extra_config' in quantization_config}"
-        )
-
-        # Write config files
-        model = self.model_context.model
-        if hasattr(model, "config"):
-            model.config.quantization_config = quantization_config
-
-        config_path = os.path.join(output_dir, "config.json")
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(model.config.to_dict(), f, indent=2, default=str)
-        logger.info(f"[dry-run] Wrote {config_path}")
-
-        qconfig_path = os.path.join(output_dir, "quantization_config.json")
-        with open(qconfig_path, "w", encoding="utf-8") as f:
-            json.dump(quantization_config, f, indent=2, default=str)
-        logger.info(f"[dry-run] Wrote {qconfig_path}")
-
-        # Copy tokenizer files if present
-        tokenizer = self.model_context.tokenizer
-        if tokenizer is not None:
-            tokenizer.save_pretrained(output_dir)
-            logger.info(f"[dry-run] Saved tokenizer to {output_dir}")
-
-        # Remove stale weight files that don't match the new config
-        self._remove_stale_weights(output_dir, quantization_config)
-
-        logger.info("=" * 60)
-        logger.info("[dry-run] DRY-RUN COMPLETE: config files written, no weights saved")
-        logger.info("=" * 60)
 
     def _discover_mtp_layers(self, quantization_config: dict) -> None:
         """Discover MTP layers from source checkpoint and update config.
@@ -1554,98 +1544,3 @@ class BaseCompressor(object):
 
         if extra_config:
             quantization_config["extra_config"] = extra_config
-
-    def _remove_stale_weights(self, output_dir: str, quantization_config: dict) -> None:
-        """Remove stale weight files that don't match the new block_name_to_quantize.
-
-        When dry-run overwrites config files, the model directory may still have
-        weight files from a previous quantization run that quantized different
-        blocks (e.g., vision encoder). This function removes those stale weights
-        to prevent vLLM from failing to load.
-        """
-        import json
-        import os
-
-        logger.info(f"[dry-run] _remove_stale_weights: checking {output_dir}")
-
-        index_file = os.path.join(output_dir, "model.safetensors.index.json")
-        if not os.path.exists(index_file):
-            logger.debug(f"[dry-run] _remove_stale_weights: no index file, skipping")
-            return
-
-        try:
-            with open(index_file) as f:
-                index = json.load(f)
-        except Exception:
-            return
-
-        weight_map = index.get("weight_map", {})
-        if not weight_map:
-            return
-
-        # Get valid block prefixes from config
-        block_name_to_quantize = quantization_config.get("block_name_to_quantize")
-        if block_name_to_quantize is None:
-            logger.debug("[dry-run] _remove_stale_weights: block_name_to_quantize is None, skipping")
-            return
-        if isinstance(block_name_to_quantize, str):
-            block_name_to_quantize = [b.strip() for b in block_name_to_quantize.split(",") if b.strip()]
-
-        logger.debug(f"[dry-run] _remove_stale_weights: block_name_to_quantize = {block_name_to_quantize}")
-
-        # VISION_AUDIO_KEYS to exclude from valid blocks
-        VISION_AUDIO_KEYS = ["visual", "audio", "vision"]
-        valid_blocks = [
-            b for b in block_name_to_quantize
-            if not any(k in b.lower() for k in VISION_AUDIO_KEYS)
-        ]
-        logger.debug(f"[dry-run] _remove_stale_weights: valid_blocks = {valid_blocks}")
-
-        # Find stale weight keys (quantized weights not in valid blocks)
-        stale_keys = []
-        for tensor_name in weight_map:
-            # Only check quantized weight keys (qweight, qzeros, scales)
-            if not any(tensor_name.endswith(suffix) for suffix in [".qweight", ".qzeros", ".scales"]):
-                continue
-            # Check if the tensor belongs to a valid block
-            # Extract the block prefix by finding the first numeric layer index
-            parts = tensor_name.split(".")
-            block_prefix = None
-            for i, part in enumerate(parts):
-                if part.isdigit():
-                    block_prefix = ".".join(parts[:i])
-                    break
-            if block_prefix and not any(block_prefix.startswith(b) or block_prefix == b for b in valid_blocks):
-                stale_keys.append(tensor_name)
-
-        if not stale_keys:
-            return
-
-        # Collect stale shard files and remove them
-        stale_shards = set()
-        for key in stale_keys:
-            shard = weight_map.get(key)
-            if shard:
-                stale_shards.add(shard)
-
-        # Also check for single-file format
-        single_file = os.path.join(output_dir, "model.safetensors")
-        if os.path.exists(single_file) and stale_keys:
-            # If single file contains stale keys, remove it
-            stale_shards.add("model.safetensors")
-
-        for shard in stale_shards:
-            shard_path = os.path.join(output_dir, shard)
-            if os.path.exists(shard_path):
-                os.remove(shard_path)
-                logger.info(f"[dry-run] Removed stale weight file: {shard}")
-
-        # Update index to remove stale keys
-        for key in stale_keys:
-            weight_map.pop(key, None)
-
-        # Write updated index
-        with open(index_file, "w") as f:
-            json.dump(index, f, indent=2)
-
-        logger.info(f"[dry-run] Removed {len(stale_keys)} stale quantized weight(s) from {len(stale_shards)} shard(s)")

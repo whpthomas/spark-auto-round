@@ -61,7 +61,7 @@ class QuantizationReport:
 
         report = QuantizationReport(
             model_name="Qwen/Qwen3.5-0.8B",
-            version="0.14.1",
+            version="0.14.2",
             cli_args={"batch_size": 8, "iters": 1000},
         )
         # After each block:
@@ -199,7 +199,7 @@ class QuantizationReport:
         """Format a loss value for display."""
         if value == 0:
             return "0"
-        return f"{value*1000000:.2f}"
+        return f"{value*1000000:.0f}"
 
     def _format_report(self) -> list[str]:
         """Build the full report as a list of lines."""

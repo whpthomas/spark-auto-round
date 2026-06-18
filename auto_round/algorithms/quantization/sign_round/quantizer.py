@@ -308,7 +308,7 @@ class SignRoundQuantizer(BaseQuantizers):
         if self.iters > 0:
             dump_info = (
                 f"quantized {len(quantized_layer_names)}/{(len(quantized_layer_names) + len(unquantized_layer_names))} "
-                f"layers in the block, uloss iter 0: {init_loss*1000000:.2f} -> iter {best_iter}: {last_loss*1000000:.2f}"
+                f"layers in the block, uloss iter 0: {init_loss*1000000:.0f} -> iter {best_iter}: {last_loss*1000000:.0f}"
             )
         else:
             dump_info = (

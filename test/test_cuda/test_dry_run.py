@@ -41,17 +41,15 @@ class TestDryRunBasic:
                 dataset=None,
                 dry_run=True,
             )
-            ar.post_init()
-
-            # Manually call _save_config_dry_run
-            ar._save_config_dry_run(tmpdir)
+            # Use quantize_and_save instead of _save_config_dry_run
+            model, output_dir = ar.quantize_and_save(tmpdir, format="auto_round")
 
             # Check config.json exists
-            config_json_path = os.path.join(tmpdir, "config.json")
+            config_json_path = os.path.join(output_dir, "config.json")
             assert os.path.exists(config_json_path), "config.json should exist"
 
             # Check quantization_config.json exists
-            qconfig_path = os.path.join(tmpdir, "quantization_config.json")
+            qconfig_path = os.path.join(output_dir, "quantization_config.json")
             assert os.path.exists(qconfig_path), "quantization_config.json should exist"
 
     def test_dry_run_no_safetensors(self, dry_run_opt_model_path):
@@ -66,11 +64,10 @@ class TestDryRunBasic:
                 dataset=None,
                 dry_run=True,
             )
-            ar.post_init()
-            ar._save_config_dry_run(tmpdir)
+            model, output_dir = ar.quantize_and_save(tmpdir, format="auto_round")
 
             # No .safetensors files
-            safetensors = [f for f in os.listdir(tmpdir) if f.endswith(".safetensors")]
+            safetensors = [f for f in os.listdir(output_dir) if f.endswith(".safetensors")]
             assert len(safetensors) == 0, f"Should not write safetensors, found: {safetensors}"
 
     def test_dry_run_no_quantization_report(self, dry_run_opt_model_path):
@@ -85,11 +82,10 @@ class TestDryRunBasic:
                 dataset=None,
                 dry_run=True,
             )
-            ar.post_init()
-            ar._save_config_dry_run(tmpdir)
+            model, output_dir = ar.quantize_and_save(tmpdir, format="auto_round")
 
             # No quantization-report files
-            report_files = [f for f in os.listdir(tmpdir) if "quantization-report" in f]
+            report_files = [f for f in os.listdir(output_dir) if "quantization-report" in f]
             assert len(report_files) == 0, f"Should not write report files, found: {report_files}"
 
     def test_dry_run_quantization_config_content(self, dry_run_opt_model_path):
@@ -104,10 +100,9 @@ class TestDryRunBasic:
                 dataset=None,
                 dry_run=True,
             )
-            ar.post_init()
-            ar._save_config_dry_run(tmpdir)
+            model, output_dir = ar.quantize_and_save(tmpdir, format="auto_round")
 
-            qconfig_path = os.path.join(tmpdir, "quantization_config.json")
+            qconfig_path = os.path.join(output_dir, "quantization_config.json")
             with open(qconfig_path) as f:
                 qconfig = json.load(f)
 
@@ -143,8 +138,7 @@ class TestDryRunBasic:
                 dataset=None,
                 dry_run=True,
             )
-            ar.post_init()
-            ar._save_config_dry_run(tmpdir)
+            model, output_dir = ar.quantize_and_save(tmpdir, format="auto_round")
 
             # Compare weights
             model_after = ar.model_context.model
@@ -167,8 +161,7 @@ class TestDryRunBasic:
                 dataset=None,
                 dry_run=True,
             )
-            ar.post_init()
-            ar._save_config_dry_run(tmpdir)
+            model, output_dir = ar.quantize_and_save(tmpdir, format="auto_round")
             elapsed = time.time() - start
 
             assert elapsed < 15, f"dry-run took {elapsed:.1f}s, should be < 15s"

@@ -17,7 +17,7 @@ import inspect
 import json
 import os
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Union
 
 import torch
 
@@ -44,6 +44,11 @@ ARCHITECTURE_MODEL_TYPE_MAP = {
 }
 
 FIX_MISTRAL_REGEX_MODEL_TYPE_LIST = ["longcat_next"]
+
+_is_mllm_model_cache: dict = {}
+# Model types that have multimodal components but should use LLM compressor
+# (text-only calibration, non-text modules excluded from quantization).
+_LLM_ONLY_MODEL_TYPES = {"bagel"}
 
 
 def resolve_model_type(model):
@@ -86,6 +91,72 @@ def is_moe_layer(module: torch.nn.Module) -> bool:
             "Qwen3OmniMoeTalkerTextSparseMoeBlock".lower(),
         ]
     )
+
+
+def get_model_name_or_path(model_or_path: Union[str, "torch.nn.Module"]) -> "str | None":
+    """Extract the model name/path from a model object or string."""
+    if isinstance(model_or_path, str):
+        return model_or_path
+    return getattr(model_or_path, "_name_or_path", None) or getattr(model_or_path, "name_or_path", None)
+
+
+def is_mllm_model(model_or_path: Union[str, "torch.nn.Module"], platform: str = None) -> bool:
+    """Check if model is a multimodal model (vision, audio, etc.).
+
+    Ported from upstream auto-round auto_round/utils/model.py:958-1009.
+    """
+    from auto_round.utils.common import MM_KEYS
+    from auto_round.utils.model.load import download_hf_model
+
+    model_path = get_model_name_or_path(model_or_path)
+
+    # Fast path: return cached result for already-seen paths
+    if model_path in _is_mllm_model_cache:
+        return _is_mllm_model_cache[model_path]
+
+    # Check model_type exclusion: some models have multimodal components
+    # but should be quantized as LLM (e.g., BAGEL MoT).
+    _model_type = None
+    if isinstance(model_or_path, torch.nn.Module) and hasattr(model_or_path, "config"):
+        _model_type = getattr(model_or_path.config, "model_type", None)
+    elif isinstance(model_path, str) and os.path.isdir(model_path):
+        _cfg_path = os.path.join(model_path, "config.json")
+        if os.path.exists(_cfg_path):
+            with open(_cfg_path) as _f:
+                _model_type = json.load(_f).get("model_type")
+    if _model_type in _LLM_ONLY_MODEL_TYPES:
+        return False
+
+    # For dummy model, model_path could be "".
+    # Only try to download if the path looks like a HF repo id (not a local filesystem path).
+    _is_local_path = os.path.isabs(model_path) or model_path.startswith("./") or model_path.startswith("../")
+    if model_path and not os.path.isdir(model_path) and not _is_local_path:
+        model_path = download_hf_model(model_path)
+
+    result = False
+    if isinstance(model_path, str):
+        if os.path.exists(os.path.join(model_path, "preprocessor_config.json")):
+            result = True
+        elif os.path.exists(os.path.join(model_path, "processor_config.json")):
+            result = True
+        elif os.path.exists(os.path.join(model_path, "config.json")):
+            with open(os.path.join(model_path, "config.json")) as f:
+                config = json.load(f)
+            for key in config.keys():
+                if any([k in key for k in MM_KEYS]):
+                    result = True
+                    break
+
+    if not result and isinstance(model_or_path, torch.nn.Module):
+        for name, module in model_or_path.named_modules():
+            if any([k in name for k in MM_KEYS]):
+                result = True
+                break
+
+    # Cache by the original path key
+    original_key = get_model_name_or_path(model_or_path)
+    _is_mllm_model_cache[original_key] = result
+    return result
 
 
 def is_pure_text_model(model) -> bool:

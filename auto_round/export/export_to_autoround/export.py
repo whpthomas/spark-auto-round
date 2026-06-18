@@ -271,7 +271,10 @@ def save_quantized_as_autoround(
         model = copy.deepcopy(model.to("cpu"))
 
     quantization_config = serialization_dict
-    quantization_config["block_name_to_quantize"] = quantization_config.pop("to_quant_block_names", None)
+    # Only pop to_quant_block_names if block_name_to_quantize is not already set
+    # (it may have been set by _build_quantization_config)
+    if "block_name_to_quantize" not in quantization_config or quantization_config.get("block_name_to_quantize") is None:
+        quantization_config["block_name_to_quantize"] = quantization_config.pop("to_quant_block_names", None)
     quantization_config["quant_method"] = "auto-round"
     quantization_config["packing_format"] = backend
 

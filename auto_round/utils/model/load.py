@@ -393,3 +393,157 @@ def llm_load_model(
     model = _to_model_dtype(model, model_dtype)
 
     return model, tokenizer
+
+
+def mllm_load_model(
+    pretrained_model_name_or_path: str,
+    platform: str = "hf",
+    device: str = "cpu",
+    torch_dtype: str = "auto",
+    use_auto_mapping: bool = True,
+    trust_remote_code: bool = True,
+    model_dtype: str = None,
+    **kwargs,
+):
+    """Load a multimodal (MLLM) model, processor, tokenizer, and image_processor.
+
+    Ported from upstream auto-round auto_round/utils/model.py:500-798.
+    Uses the correct architecture class (e.g. Qwen3_5ForConditionalGeneration)
+    instead of AutoModelForCausalLM, preserving nested model structure.
+
+    Returns:
+        tuple: (model, processor, tokenizer, image_processor)
+    """
+    _check_accelerate_version()
+
+    assert platform.lower() == "hf", "Only hf platform is supported in this fork."
+
+    from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+
+    from auto_round.utils.device import get_device_and_parallelism, override_cuda_device_capability
+
+    device_str, use_auto_mapping = get_device_and_parallelism(device)
+    torch_dtype = "auto"
+
+    # Read raw config BEFORE model loading to preserve nested structure
+    # (text_config, vision_config, image_token_id, etc.).
+    # cls.from_pretrained() flattens sub-configs and rewrites model_type
+    # (e.g. qwen3_5 -> qwen3_5_text), which breaks vLLM compatibility.
+    raw_config = AutoConfig.from_pretrained(
+        pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+    )
+
+    model_type = raw_config.model_type
+    processor, image_processor = None, None
+
+    # Use the correct architecture class
+    architectures = raw_config.architectures[0]
+
+    cls = None
+    # 1. Try AutoModelForCausalLM (handles most models)
+    if architectures.endswith("Model") and hasattr(
+        AutoModelForCausalLM, n := architectures.replace("Model", "ForConditionalGeneration")
+    ):
+        cls = getattr(AutoModelForCausalLM, n)
+    elif hasattr(AutoModelForCausalLM, architectures):
+        cls = getattr(AutoModelForCausalLM, architectures)
+
+    # 2. Try importing from transformers directly (needed for some MLLM models
+    #    like Qwen3_5ForConditionalGeneration that aren't in AutoModelForCausalLM)
+    if cls is None:
+        import transformers as _tf
+        if hasattr(_tf, architectures):
+            cls = getattr(_tf, architectures)
+            logger.info("Using architecture class %s from transformers", architectures)
+
+    # 3. Fall back to AutoModelForCausalLM
+    if cls is None:
+        cls = AutoModelForCausalLM
+
+    try:
+        model = cls.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            torch_dtype=torch_dtype,
+            device_map="auto" if use_auto_mapping else None,
+        )
+    except ValueError as e:
+        if "FP8 quantized" in str(e):
+            with override_cuda_device_capability():
+                model = cls.from_pretrained(
+                    pretrained_model_name_or_path,
+                    trust_remote_code=trust_remote_code,
+                    torch_dtype=torch_dtype,
+                    device_map="auto" if use_auto_mapping else None,
+                )
+            logger.warning("the support for fp8 model as input is experimental, please use with caution.")
+        else:
+            raise
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+    )
+
+    try:
+        processor = AutoProcessor.from_pretrained(
+            pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+        )
+    except Exception:
+        pass
+
+    try:
+        from transformers import AutoImageProcessor
+        image_processor = AutoImageProcessor.from_pretrained(
+            pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+        )
+    except Exception:
+        pass
+
+    # Restore the raw config to preserve sub-configs (text_config, vision_config)
+    # and the original model_type. The flattened config from transformers breaks
+    # vLLM's config resolution (e.g. max_position_embeddings lookup).
+    model.config = raw_config
+
+    # Set block names for MLLM models if the config specifies them.
+    # For MLLM models, to_quant_block_names should be a string pattern
+    # (e.g. "model.language_model.layers") or None (auto-detect all blocks).
+    # We do NOT set it to a list here — find_matching_blocks handles lists
+    # by returning them directly, which bypasses block detection.
+    config_block_names = getattr(raw_config, "block_name_to_quantize", None)
+    if config_block_names and not isinstance(config_block_names, (list, tuple)):
+        model._autoround_to_quant_block_names = config_block_names
+
+    # Mark vision encoder for optional quantization
+    # By default, vision encoder runs in full precision (bf16)
+    # Set quant_nontext_module=True to quantize vision encoder as well
+    if hasattr(model, 'visual'):
+        model._autoround_quant_nontext_module = kwargs.get('quant_nontext_module', False)
+        if model._autoround_quant_nontext_module:
+            logger.info("Vision encoder will be quantized (quant_nontext_module=True)")
+        else:
+            logger.info("Vision encoder will run in full precision (quant_nontext_module=False)")
+
+    model = model.eval()
+    check_and_mark_quantized_module(model)
+    handle_generation_config(model)
+    model = _to_model_dtype(model, model_dtype)
+
+    # Log multi-GPU and memory usage information
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        if gpu_count > 1:
+            logger.info(f"Using multi-GPU setup: {gpu_count} GPUs detected")
+            for i in range(gpu_count):
+                gpu_name = torch.cuda.get_device_name(i)
+                gpu_memory = torch.cuda.get_device_properties(i).total_memory / (1024 ** 3)
+                logger.debug(f"  GPU {i}: {gpu_name} ({gpu_memory:.2f} GB)")
+        # Log memory usage for MLLM models
+        memory_allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+        memory_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+        logger.info(
+            f"MLLM model loaded. GPU memory: "
+            f"{memory_allocated:.2f} GB allocated, "
+            f"{memory_reserved:.2f} GB reserved"
+        )
+
+    return model, processor, tokenizer, image_processor

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="spark-auto-round",
-    version="0.14.1",
+    version="0.14.2",
     description="Trimmed-down auto-round for CUDA, torch_compile, W4A16 on GB10",
     author="Spark Team",
     license="Apache-2.0",

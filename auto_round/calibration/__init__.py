@@ -19,6 +19,7 @@ from auto_round.calibration.register import CALIBRATORS, get_calibrator, registe
 
 # Importing the strategy modules triggers their ``@register_calibrator`` decorators.
 from auto_round.calibration import llm as _llm  # noqa: F401
+from auto_round.calibration import mllm as _mllm  # noqa: F401
 from auto_round.calibration import diffusion as _diffusion  # noqa: F401
 
 __all__ = [

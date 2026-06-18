@@ -748,7 +748,10 @@ def get_opencode_instruct_dataset(
             return
         # Truncate if over seqlen, pad if under
         seq = seq[:seqlen]
-        attention_mask = [1] * len(seq) + [0] * (seqlen - len(seq))
+        # Use all-ones mask: packed sequences are calibration data, not real
+        # padded sequences. Padding 0s would disable SDPA's is_causal=True
+        # fast path and cause shape-mismatch crashes (e.g. Qwen3.5).
+        attention_mask = [1] * seqlen
         seq = seq + [pad_token_id] * (seqlen - len(seq))
         packed_input_ids.append(seq)
         packed_attention_mask.append(attention_mask)

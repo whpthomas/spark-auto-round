@@ -208,3 +208,105 @@ class TestConfigNormalizationsDict:
         entry = _CONFIG_NORMALIZATIONS["qwen3_5_moe"]
         assert entry["model_type"] == "qwen3_5_moe"
         assert entry["architectures"] == ["Qwen3_5MoeForConditionalGeneration"]
+
+
+class TestIsMllmModel:
+    """Test is_mllm_model() multimodal detection function."""
+
+    def test_is_mllm_model_with_vision_config(self, tmp_path):
+        """Model with vision_config should be detected as multimodal."""
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "vision_config": {"dtype": "bfloat16"},
+        }
+        config_path = tmp_path / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        from auto_round.utils.model.detect import is_mllm_model
+        assert is_mllm_model(str(tmp_path)) is True
+
+    def test_is_mllm_model_with_preprocessor_config(self, tmp_path):
+        """Model with preprocessor_config.json should be detected as multimodal."""
+        config_path = tmp_path / "preprocessor_config.json"
+        config_path.write_text("{}")
+
+        from auto_round.utils.model.detect import is_mllm_model
+        assert is_mllm_model(str(tmp_path)) is True
+
+    def test_is_mllm_model_with_processor_config(self, tmp_path):
+        """Model with processor_config.json should be detected as multimodal."""
+        config_path = tmp_path / "processor_config.json"
+        config_path.write_text("{}")
+
+        from auto_round.utils.model.detect import is_mllm_model
+        assert is_mllm_model(str(tmp_path)) is True
+
+    def test_is_mllm_model_pure_text(self, tmp_path):
+        """Pure text model should NOT be detected as multimodal."""
+        config = {
+            "model_type": "llama",
+            "architectures": ["LlamaForCausalLM"],
+        }
+        config_path = tmp_path / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        from auto_round.utils.model.detect import is_mllm_model
+        assert is_mllm_model(str(tmp_path)) is False
+
+    def test_is_mllm_model_caching(self, tmp_path):
+        """Results should be cached for performance."""
+        config = {"model_type": "qwen3_5", "vision_config": {}}
+        config_path = tmp_path / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        from auto_round.utils.model.detect import is_mllm_model, _is_mllm_model_cache
+        path_str = str(tmp_path)
+        # Clear cache
+        _is_mllm_model_cache.pop(path_str, None)
+        result1 = is_mllm_model(path_str)
+        result2 = is_mllm_model(path_str)
+        assert result1 == result2 is True
+        assert path_str in _is_mllm_model_cache
+
+    def test_is_mllm_model_empty_dir(self, tmp_path):
+        """Empty directory (no config) should NOT be detected as multimodal."""
+        from auto_round.utils.model.detect import is_mllm_model
+        assert is_mllm_model(str(tmp_path)) is False
+
+    def test_llm_only_model_type_excluded(self, tmp_path):
+        """BAGEL model_type should be excluded from multimodal detection."""
+        config = {
+            "model_type": "bagel",
+            "architectures": ["BagelForConditionalGeneration"],
+            "vision_config": {},
+        }
+        config_path = tmp_path / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        from auto_round.utils.model.detect import is_mllm_model
+        assert is_mllm_model(str(tmp_path)) is False
+
+
+class TestGetModelNameOrPath:
+    """Test get_model_name_or_path() helper."""
+
+    def test_string_input(self):
+        """String input should be returned as-is."""
+        from auto_round.utils.model.detect import get_model_name_or_path
+        assert get_model_name_or_path("Qwen/Qwen3.5-0.8B") == "Qwen/Qwen3.5-0.8B"
+
+    def test_empty_string(self):
+        """Empty string should be returned as-is."""
+        from auto_round.utils.model.detect import get_model_name_or_path
+        assert get_model_name_or_path("") == ""
+
+    def test_none_returns_none(self):
+        """None input should return None (getattr fails)."""
+        from auto_round.utils.model.detect import get_model_name_or_path
+        # None has no _name_or_path attribute, so getattr returns None
+        assert get_model_name_or_path(None) is None
