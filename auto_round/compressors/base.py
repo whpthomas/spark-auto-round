@@ -1412,6 +1412,9 @@ class BaseCompressor(object):
             backend=kwargs.get("backend", "auto_round:auto_gptq")
         )
 
+        # Discover MTP layers from source checkpoint (mirrors copy_missing_tensors_from_source logic)
+        self._discover_mtp_layers(quantization_config)
+
         logger.info(
             f"[dry-run] quantization_config built:\n"
             f"  block_name_to_quantize = {quantization_config.get('block_name_to_quantize')!r}\n"
@@ -1441,6 +1444,208 @@ class BaseCompressor(object):
             tokenizer.save_pretrained(output_dir)
             logger.info(f"[dry-run] Saved tokenizer to {output_dir}")
 
+        # Remove stale weight files that don't match the new config
+        self._remove_stale_weights(output_dir, quantization_config)
+
         logger.info("=" * 60)
         logger.info("[dry-run] DRY-RUN COMPLETE: config files written, no weights saved")
         logger.info("=" * 60)
+
+    def _discover_mtp_layers(self, quantization_config: dict) -> None:
+        """Discover MTP layers from source checkpoint and update config.
+
+        Mirrors the logic in missing_tensors._woq_quantize_missing_tensors that
+        discovers new block prefixes (like mtp.layers) and adds ignored layers
+        (like mtp.fc) to extra_config.
+        """
+        import json
+        import os
+
+        model = self.model_context.model
+
+        # Get source model directory
+        source_dir = None
+        for attr in ["name_or_path"]:
+            val = getattr(model, attr, None)
+            if isinstance(val, str) and val:
+                source_dir = val
+                break
+        if source_dir is None:
+            config = getattr(model, "config", None)
+            if config is not None:
+                for attr in ["_name_or_path", "name_or_path"]:
+                    val = getattr(config, attr, None)
+                    if isinstance(val, str) and val:
+                        source_dir = val
+                        break
+
+        if not source_dir or not os.path.isdir(source_dir):
+            # Try to resolve from HuggingFace cache
+            try:
+                from huggingface_hub import try_to_load_from_cache
+
+                cached = try_to_load_from_cache(source_dir, "model.safetensors.index.json")
+                if isinstance(cached, str) and os.path.exists(cached):
+                    source_dir = os.path.dirname(cached)
+            except Exception:
+                pass
+
+        if not source_dir or not os.path.isdir(source_dir):
+            logger.debug("[dry-run] Cannot resolve source directory for MTP discovery")
+            return
+
+        # Read source checkpoint to discover weight prefixes
+        index_file = os.path.join(source_dir, "model.safetensors.index.json")
+        if not os.path.exists(index_file):
+            return
+
+        try:
+            with open(index_file) as f:
+                src_index = json.load(f)
+        except Exception:
+            return
+
+        src_tensor_names = set(src_index.get("weight_map", {}).keys())
+
+        # Discover new block prefixes from source tensors
+        existing_blocks = quantization_config.get("block_name_to_quantize")
+        if existing_blocks is None:
+            return
+        if isinstance(existing_blocks, str):
+            existing_blocks = [b.strip() for b in existing_blocks.split(",") if b.strip()]
+        existing_set = set(existing_blocks)
+
+        # Find prefixes that have numeric layer indices
+        new_prefixes = set()
+        for tensor_name in src_tensor_names:
+            if not tensor_name.endswith(".weight"):
+                continue
+            parts = tensor_name.split(".")
+            for i, part in enumerate(parts):
+                if part.isdigit():
+                    prefix = ".".join(parts[:i])
+                    if prefix and prefix not in existing_set:
+                        new_prefixes.add(prefix)
+
+        added = sorted(new_prefixes - existing_set)
+        # Filter out vision/audio blocks - only keep language model blocks
+        VISION_AUDIO_KEYS = ["visual", "audio", "vision"]
+        added = [p for p in added if not any(k in p.lower() for k in VISION_AUDIO_KEYS)]
+        if added:
+            merged = existing_blocks + added
+            # Remove duplicates and nested prefixes
+            merged = [b for b in merged if not any(b != other and b.startswith(other + ".") for other in merged)]
+            quantization_config["block_name_to_quantize"] = merged
+            logger.info(f"[dry-run] Discovered MTP blocks: {added}")
+            logger.info(f"[dry-run] Updated block_name_to_quantize: {merged}")
+
+        # Add ignored layers (like mtp.fc) to extra_config
+        BLOCK_NAME_TO_IGNORE = [".shared_expert_gate.", ".mlp.gate.", ".g_proj.", "mtp.fc."]
+        extra_config = quantization_config.get("extra_config", {})
+        for tensor_name in src_tensor_names:
+            if not tensor_name.endswith(".weight"):
+                continue
+            layer_name = tensor_name[:-len(".weight")]
+            if layer_name in extra_config:
+                continue
+            if any(block in tensor_name for block in BLOCK_NAME_TO_IGNORE):
+                extra_config[layer_name] = {"bits": 16, "data_type": "fp"}
+                logger.info(f"[dry-run] Added ignored layer to extra_config: {layer_name}")
+
+        if extra_config:
+            quantization_config["extra_config"] = extra_config
+
+    def _remove_stale_weights(self, output_dir: str, quantization_config: dict) -> None:
+        """Remove stale weight files that don't match the new block_name_to_quantize.
+
+        When dry-run overwrites config files, the model directory may still have
+        weight files from a previous quantization run that quantized different
+        blocks (e.g., vision encoder). This function removes those stale weights
+        to prevent vLLM from failing to load.
+        """
+        import json
+        import os
+
+        logger.info(f"[dry-run] _remove_stale_weights: checking {output_dir}")
+
+        index_file = os.path.join(output_dir, "model.safetensors.index.json")
+        if not os.path.exists(index_file):
+            logger.debug(f"[dry-run] _remove_stale_weights: no index file, skipping")
+            return
+
+        try:
+            with open(index_file) as f:
+                index = json.load(f)
+        except Exception:
+            return
+
+        weight_map = index.get("weight_map", {})
+        if not weight_map:
+            return
+
+        # Get valid block prefixes from config
+        block_name_to_quantize = quantization_config.get("block_name_to_quantize")
+        if block_name_to_quantize is None:
+            logger.debug("[dry-run] _remove_stale_weights: block_name_to_quantize is None, skipping")
+            return
+        if isinstance(block_name_to_quantize, str):
+            block_name_to_quantize = [b.strip() for b in block_name_to_quantize.split(",") if b.strip()]
+
+        logger.debug(f"[dry-run] _remove_stale_weights: block_name_to_quantize = {block_name_to_quantize}")
+
+        # VISION_AUDIO_KEYS to exclude from valid blocks
+        VISION_AUDIO_KEYS = ["visual", "audio", "vision"]
+        valid_blocks = [
+            b for b in block_name_to_quantize
+            if not any(k in b.lower() for k in VISION_AUDIO_KEYS)
+        ]
+        logger.debug(f"[dry-run] _remove_stale_weights: valid_blocks = {valid_blocks}")
+
+        # Find stale weight keys (quantized weights not in valid blocks)
+        stale_keys = []
+        for tensor_name in weight_map:
+            # Only check quantized weight keys (qweight, qzeros, scales)
+            if not any(tensor_name.endswith(suffix) for suffix in [".qweight", ".qzeros", ".scales"]):
+                continue
+            # Check if the tensor belongs to a valid block
+            # Extract the block prefix by finding the first numeric layer index
+            parts = tensor_name.split(".")
+            block_prefix = None
+            for i, part in enumerate(parts):
+                if part.isdigit():
+                    block_prefix = ".".join(parts[:i])
+                    break
+            if block_prefix and not any(block_prefix.startswith(b) or block_prefix == b for b in valid_blocks):
+                stale_keys.append(tensor_name)
+
+        if not stale_keys:
+            return
+
+        # Collect stale shard files and remove them
+        stale_shards = set()
+        for key in stale_keys:
+            shard = weight_map.get(key)
+            if shard:
+                stale_shards.add(shard)
+
+        # Also check for single-file format
+        single_file = os.path.join(output_dir, "model.safetensors")
+        if os.path.exists(single_file) and stale_keys:
+            # If single file contains stale keys, remove it
+            stale_shards.add("model.safetensors")
+
+        for shard in stale_shards:
+            shard_path = os.path.join(output_dir, shard)
+            if os.path.exists(shard_path):
+                os.remove(shard_path)
+                logger.info(f"[dry-run] Removed stale weight file: {shard}")
+
+        # Update index to remove stale keys
+        for key in stale_keys:
+            weight_map.pop(key, None)
+
+        # Write updated index
+        with open(index_file, "w") as f:
+            json.dump(index, f, indent=2)
+
+        logger.info(f"[dry-run] Removed {len(stale_keys)} stale quantized weight(s) from {len(stale_shards)} shard(s)")

@@ -1243,7 +1243,9 @@ def revert_checkpoint_conversion_mapping(name: str, key_mapping: dict[str, str])
             target_patterns = [target_patterns]
         for target_pattern in target_patterns:
             source_pattern = source_pattern.lstrip("^")  # strip off un-needed chars and patterns
-            source_pattern = re.sub(r"\(.*\)", "", source_pattern)
+            # Strip negative lookahead groups (?!...) but keep capture groups (.+)
+            # since they are referenced by backreferences in target_pattern
+            source_pattern = re.sub(r"\(\?![^)]*\)", "", source_pattern)
             name, n_replace = re.subn(source_pattern, target_pattern, name)
             # Early exit of the loop
             if n_replace > 0:
