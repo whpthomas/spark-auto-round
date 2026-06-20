@@ -596,6 +596,7 @@ class TestUpdateQuantizationConfig:
             "model.language_model.layers.54.mlp.up_proj.weight": torch.randn(10, 10),
             "model.language_model.layers.54.mlp.down_proj.weight": torch.randn(10, 10),
             "model.language_model.layers.54.input_layernorm.weight": torch.randn(10),
+            "model.language_model.layers.54.self_attn.q_proj.weight": torch.randn(10, 10),
         }
 
         update_quantization_config(str(output_dir), [54], weights)
@@ -605,11 +606,24 @@ class TestUpdateQuantizationConfig:
         
         extra = qc["extra_config"]
         # Linear weights should be added to extra_config as FP16
-        # Note: vLLM expects names WITHOUT .weight suffix
-        assert "model.language_model.layers.54.mlp.gate_proj" in extra
-        assert extra["model.language_model.layers.54.mlp.gate_proj"]["bits"] == 16
-        assert "model.language_model.layers.54.mlp.up_proj" in extra
-        assert "model.language_model.layers.54.mlp.down_proj" in extra
+        # Keys are stored in HuggingFace format (model.language_model.layers.X...)
+        # vLLM's mapper will transform them to vLLM format (language_model.model.layers.X...)
+        # 
+        # CRITICAL: MoE-related keys (mlp.experts, mlp.gate_proj, etc.) should NOT be added!
+        # The original quantized model has 0 MoE-related extra_config keys and works correctly.
+        # Adding MoE keys interferes with vllm's normal quantization detection.
+        
+        # Non-MoE layers should be added (attention)
+        assert "model.language_model.layers.54.self_attn.q_proj" in extra
+        assert extra["model.language_model.layers.54.self_attn.q_proj"]["bits"] == 16
+        
+        # MoE-related layers should NOT be added (individual tensors)
+        # But the MoE layer prefix itself SHOULD be added for substituted layers
+        assert "model.language_model.layers.54.mlp.experts" in extra  # MoE layer prefix
+        assert "model.language_model.layers.54.mlp.gate_proj" not in extra  # Individual tensor
+        assert "model.language_model.layers.54.mlp.up_proj" not in extra  # Individual tensor
+        assert "model.language_model.layers.54.mlp.down_proj" not in extra  # Individual tensor
+        
         # Layernorm should NOT be added (it's always FP16)
         assert "model.language_model.layers.54.input_layernorm" not in extra
 

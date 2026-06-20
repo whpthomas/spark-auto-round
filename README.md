@@ -12,11 +12,11 @@
 
 This is new software under active development. I am working my way up from Qwen 0.8b -> 27B -> 35B, 122B -> Gemma etc. I will post updates with verified results on specific models here:  
 
-| Model | Tested | Score |
+| Model | Tested | Tool Eval Score |
 |-------|--------|-------|
 | Qwen 3.5 0.8b      | ✔︎ | 67 |
 | Qwen 3.6 27b       | ✔︎ | 92 |
-| Qwen 3.6 35b a3b   |   |    |
+| Qwen 3.6 35b a3b   | ✔︎ | 92 |
 | Qwen 3.5 122b a10b |   |    |
 | Gemma 4 12b        |   |    |
 
@@ -91,6 +91,17 @@ Spark auto round repeatedly achieved a [92/100](docs/test-score.md) tool-eval-be
 | 4 | qwen3.6-27b-sar-oc | Int4 | OpenCode Instruct | 88 | 12.5 | ★★★★ | 57/8/4 | 275K |
 | 5 | qwen3.6-27b-sar-git-mtp | Int4 | Github Code Clean | 86 | 26.2 | ★★★★ | 54/10/5 | 268K |
 | 6 | qwen/qwen3.6-27b | bf16 | - | 83 | 11.4 | ★★★★ | 53/9/7 | 243K |
+
+## Performance with Qwen 3.6 35b a3b
+
+| # | Model | Quant | Score | Min | Max | t/s | P/F | Weakest | Runs |
+|---|-------|-------|------:|----:|----:|-----|-----|---------|-----:|
+| 🥇 | qwen3.6-35b-sar-pc | INT4-AutoRound | 92.00 | 91 | 93 | 64 | 178/25/4 | 🟡 Instruct 80.00% | 3 |
+| 🥈 | qwen3.6-35b-sar-bf16 | INT4-AutoRound | 91.67 | 91 | 93 | 65 | 176/27/4 | 🟡 Plan 77.67% | 3 |
+| 🥉 | qwen3.6-35b-sar | INT4-AutoRound | 91.00 | 90 | 92 | 65 | 176/25/6 | 🟡 Create 77.67% | 3 |
+|  4 | qwen/qwen3.6-35b-fp8 | FP8 | 91.00 | 91 | 91 | 49 | 171/33/3 | 🟡 Scale 75.00% | 3 |
+|  5 | qwen3.6-35b-sar-mtp | INT4-AutoRound | 90.67 | 88 | 93 | 77 | 174/28/5 | 🟡 Instruct 80.00% | 3 |
+|  6 | qwen3.6-35b-sar-dflash | INT4-AutoRound | 88.00 | 88 | 88 | 97 | 164/37/6 | 🟠 Schema 52.67% | 3 |
 
 ### Scripts and Recipes
 

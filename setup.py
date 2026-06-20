@@ -7,10 +7,10 @@ setup(
     author="Spark Team",
     license="Apache-2.0",
     packages=find_packages(),
-    python_requires=">=3.9",
+    python_requires=">=3.10",
     install_requires=[
-        "torch>=2.1.0",
-        "transformers>=4.35.0",
+        "torch>=2.4",
+        "transformers>=4.40",
         "datasets",
         "safetensors",
         "huggingface_hub",
@@ -23,6 +23,9 @@ setup(
         "pydantic",
         "flash-linear-attention>=0.3.0",
         "causal-conv1d>=1.4.0",
+        "pandas",
+        "requests",
+        "pillow",
     ],
     extras_require={
         "dev": ["pytest", "pytest-cov"],

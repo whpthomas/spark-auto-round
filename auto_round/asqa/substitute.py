@@ -104,6 +104,42 @@ def _shard_name(idx: int, total: int) -> str:
     return f"model-{idx:05d}-of-{total:05d}.safetensors"
 
 
+def _is_moe_expert_tensor(tensor_name: str, layer_prefix: str) -> bool:
+    """Check if tensor is a MoE expert weight (not shared expert, not individual).
+
+    Returns True for fused MoE weights like:
+        model.language_model.layers.23.mlp.experts.gate_up_proj
+        model.language_model.layers.23.mlp.experts.down_proj
+
+    Returns False for:
+        model.language_model.layers.23.mlp.experts.252.gate_proj  (individual)
+        model.language_model.layers.23.mlp.shared_expert.*  (shared)
+    """
+    if not tensor_name.startswith(layer_prefix):
+        return False
+    suffix = tensor_name[len(layer_prefix):]
+    # Match: mlp.experts.gate_up_proj or mlp.experts.down_proj
+    # But NOT: mlp.experts.NNN.gate_proj (individual expert)
+    # And NOT: mlp.shared_expert.*
+    return (
+        suffix.startswith("mlp.experts.gate_up_proj")
+        or suffix.startswith("mlp.experts.down_proj")
+    ) and not any(c.isdigit() for c in suffix.split("mlp.experts.")[1].split(".")[0])
+
+
+def _fuse_gate_up_to_w13(gate_up_proj: torch.Tensor) -> torch.Tensor:
+    """Fuse gate_proj and up_proj into w13_weight.
+
+    In HuggingFace format, gate_up_proj has shape [num_experts, 2*intermediate, hidden]
+    where gate_proj and up_proj are concatenated along dim=1.
+
+    vllm's w13_weight expects the same format (fused gate and up projections).
+    """
+    # gate_up_proj is already fused in the checkpoint format
+    # Shape: [num_experts, 2*intermediate_size, hidden_size]
+    return gate_up_proj
+
+
 # ---------------------------------------------------------------------------
 # 1. infer_paths
 # ---------------------------------------------------------------------------
@@ -348,6 +384,118 @@ def load_fp16_layers(
 # ---------------------------------------------------------------------------
 
 
+def _remap_moe_weights(
+    fp16_prefix_tensors: dict[str, torch.Tensor], layer_prefix: str
+) -> dict[str, torch.Tensor]:
+    """Remap MoE expert weights to the format vllm expects for unquantized layers.
+
+    vllm expects unquantized MoE layers to have:
+        mlp.experts.routed_experts.w13_weight  (gate_up_proj)
+        mlp.experts.routed_experts.w2_weight   (down_proj)
+
+    But HuggingFace checkpoint format has:
+        mlp.experts.gate_up_proj  (fused gate + up)
+        mlp.experts.down_proj
+
+    This function remaps the names and returns new tensors.
+
+    Args:
+        fp16_prefix_tensors: Tensors for this layer (modified in place).
+        layer_prefix: Layer prefix like "model.language_model.layers.23."
+
+    Returns:
+        Updated dict with remapped names (same reference, modified in place).
+    """
+    routed_prefix = layer_prefix + "mlp.experts.routed_experts."
+    moe_prefix = layer_prefix + "mlp.experts."
+
+    # Check if this layer has MoE expert weights
+    has_gate_up = any("mlp.experts.gate_up_proj" in k for k in fp16_prefix_tensors)
+    has_down = any("mlp.experts.down_proj" in k for k in fp16_prefix_tensors)
+
+    if not (has_gate_up and has_down):
+        # Not a MoE layer or already in correct format
+        return fp16_prefix_tensors
+
+    # Remap gate_up_proj -> w13_weight
+    for k in list(fp16_prefix_tensors.keys()):
+        if "mlp.experts.gate_up_proj" in k:
+            new_key = k.replace("mlp.experts.gate_up_proj", "mlp.experts.routed_experts.w13_weight")
+            fp16_prefix_tensors[new_key] = fp16_prefix_tensors.pop(k)
+
+    # Remap down_proj -> w2_weight
+    for k in list(fp16_prefix_tensors.keys()):
+        if "mlp.experts.down_proj" in k:
+            new_key = k.replace("mlp.experts.down_proj", "mlp.experts.routed_experts.w2_weight")
+            fp16_prefix_tensors[new_key] = fp16_prefix_tensors.pop(k)
+
+    return fp16_prefix_tensors
+
+
+def _unfuse_moe_weights(
+    weights: dict[str, torch.Tensor], layer_prefix: str, num_experts: int
+) -> dict[str, torch.Tensor]:
+    """Unfuse MoE expert weights from fused to individual expert format.
+
+    HuggingFace checkpoint format has fused weights:
+        mlp.experts.gate_up_proj  (shape: [num_experts, 2*intermediate, hidden])
+        mlp.experts.down_proj     (shape: [num_experts, hidden, intermediate])
+
+    vllm expects individual expert weights:
+        mlp.experts.{expert_id}.gate_proj  (shape: [intermediate, hidden])
+        mlp.experts.{expert_id}.up_proj    (shape: [intermediate, hidden])
+        mlp.experts.{expert_id}.down_proj  (shape: [hidden, intermediate])
+
+    Args:
+        weights: Dict of weights (modified in place).
+        layer_prefix: Layer prefix like "model.language_model.layers.23."
+        num_experts: Number of experts in the MoE layer.
+
+    Returns:
+        Updated dict (same reference, modified in place).
+    """
+    experts_prefix = layer_prefix + "mlp.experts."
+    
+    # Find and unfuse gate_up_proj
+    gate_up_key = None
+    for k in weights:
+        if k.startswith(experts_prefix) and k.endswith("gate_up_proj") and "." not in k[len(experts_prefix):-len("gate_up_proj")]:
+            gate_up_key = k
+            break
+    
+    if gate_up_key is None:
+        return weights  # Already in individual format or not found
+    
+    gate_up_tensor = weights.pop(gate_up_key)
+    
+    # gate_up_proj shape: [num_experts, 2*intermediate, hidden]
+    # Split into gate_proj and up_proj along dim=1
+    intermediate_size = gate_up_tensor.shape[1] // 2
+    
+    for expert_id in range(num_experts):
+        expert_gate_up = gate_up_tensor[expert_id]  # [2*intermediate, hidden]
+        gate_proj = expert_gate_up[:intermediate_size]  # [intermediate, hidden]
+        up_proj = expert_gate_up[intermediate_size:]  # [intermediate, hidden]
+        
+        weights[f"{experts_prefix}{expert_id}.gate_proj"] = gate_proj
+        weights[f"{experts_prefix}{expert_id}.up_proj"] = up_proj
+    
+    # Find and unfuse down_proj  
+    down_key = None
+    for k in weights:
+        if k.startswith(experts_prefix) and k.endswith("down_proj") and "." not in k[len(experts_prefix):-len("down_proj")]:
+            down_key = k
+            break
+    
+    if down_key is not None:
+        down_tensor = weights.pop(down_key)
+        # down_tensor shape: [num_experts, hidden, intermediate]
+        for expert_id in range(num_experts):
+            weights[f"{experts_prefix}{expert_id}.down_proj"] = down_tensor[expert_id]
+    
+    return weights
+
+
 def substitute_layers(
     weights: dict[str, torch.Tensor],
     fp16_layers: dict[str, torch.Tensor],
@@ -403,6 +551,18 @@ def substitute_layers(
             )
 
         weights.update(fp16_prefix_tensors)
+
+        # NOTE: We do NOT rename MoE weights.
+        # vllm's weight loading code handles gate_up_proj and down_proj by:
+        # 1. Chunking gate_up_proj into two parts (w1 and w3)
+        # 2. Calling load_fused_expert_weights for each part
+        # 
+        # The weight names must contain 'experts.gate_up_proj' or 'experts.down_proj'
+        # for vllm to recognize them as fused expert weights.
+        # Renaming to 'routed_experts.w13_weight' would break this logic.
+        # vllm's weight loading code maps:
+        #   experts.gate_up_proj -> w13_weight
+        #   experts.down_proj -> w2_weight
 
     return weights
 
@@ -613,45 +773,67 @@ def update_quantization_config(
     quant_config["substituted_layers"] = sorted(set(layer_indices))
     quant_config["substituted_dtype"] = "fp16"
 
-    # Switch quant_method from "auto-round" (INC) to "auto_gptq".
+    # Keep quant_method as "auto-round" (INC format).
     #
-    # Why: INC's get_quant_method returns UnquantizedLinearMethod() for
-    # bf16 layers, but RoutedExperts needs UnquantizedFusedMoEMethod.
-    # auto_gptq correctly handles this via get_moe_quant_method() which
-    # checks the dynamic config and returns UnquantizedFusedMoEMethod
-    # for layers marked with -: prefix.
+    # Why not "auto_gptq": AutoGPTQConfig.get_config_filenames() returns
+    # ["quantize_config.json"] but we have "quantization_config.json".
+    # INCConfig.get_config_filenames() returns ["quantization_config.json"]
+    # which matches our file.
     #
-    # The dynamic config format:
-    #   {"-:model.language_model.layers.N.mlp.experts*": {}}
-    # Negative match (-: prefix) skips quantization for matching layers.
-    quant_config["quant_method"] = "auto_gptq"
-    if "desc_act" not in quant_config or quant_config["desc_act"] is None:
-        quant_config["desc_act"] = False
-    quant_config["dynamic"] = quant_config.get("dynamic", {})
+    # The latest nightly vLLM INC loader properly handles BF16 MoE layers:
+    # it checks isinstance(layer, RoutedExperts) and returns
+    # UnquantizedFusedMoEMethod (creates w13_weight, w2_weight) for
+    # layers marked with bits=16 in extra_config.
+    #
+    # No dynamic patterns needed — extra_config entries with bits=16
+    # are sufficient for INC to detect BF16 layers.
 
-    # Add negative dynamic patterns for substituted MoE layers.
-    # Pattern must be valid regex: \.* for literal dots, .* for any chars.
-    for idx in layer_indices:
-        # "model.language_model.layers.23" -> "model\.language_model\.layers\.23"
-        escaped = _layer_prefix(idx).rstrip('.').replace('.', r'\.')
-        pattern = f"-:{escaped}.*"
-        if pattern not in quant_config["dynamic"]:
-            quant_config["dynamic"][pattern] = {}
+    # Clean up any old auto_gptq artifacts from previous ASAQ runs
+    quant_config.pop("quant_method", None)  # keep auto-round from source
+    quant_config.pop("desc_act", None)  # not needed for INC
+    quant_config.pop("dynamic", None)  # not needed for INC
 
     # Update extra_config to mark all substituted layer components as FP16.
     # This is critical for vLLM: without these entries, vLLM assumes the
     # layers are quantized and tries to load qweight/qzeros/scales tensors
     # that no longer exist.
-    #
-    # vLLM's INCConfig.get_quant_method checks:
-    #   layer_name == prefix or layer_name == f"model.{prefix}"
-    # where prefix is the layer name WITHOUT the .weight suffix.
-    # So we store layer names like "model.language_model.layers.54.mlp.gate_proj"
-    # not "model.language_model.layers.54.mlp.gate_proj.weight".
     if weights is not None:
         extra_config = quant_config.get("extra_config", {})
         if not isinstance(extra_config, dict):
             extra_config = {}
+
+        # CRITICAL: Remove ALL old vLLM format MoE keys from extra_config.
+        # Previous ASAQ runs may have left keys like "language_model.model.layers.X.mlp.experts"
+        # (vLLM format) which conflict with the correct HF format keys.
+        # These MUST be removed before adding new HF format keys.
+        _vllm_moe_prefix = "language_model.model.layers."
+        old_vllm_moe_keys = [
+            k for k in extra_config
+            if k.startswith(_vllm_moe_prefix) and "mlp.experts" in k
+        ]
+        for key in old_vllm_moe_keys:
+            del extra_config[key]
+
+        # Add extra_config entries for individual sub-layers (weight, bias)
+        # IMPORTANT: Store keys in HuggingFace format (model.language_model.layers.X...)
+        # vLLM's mapper will transform them to vLLM format (language_model.model.layers.X...)
+        # This avoids double-transformation issues.
+        #
+        # CRITICAL: Do NOT add MoE-related keys (mlp.experts, mlp.experts.gate_up_proj, etc.)
+        # The original quantized model has 0 MoE-related extra_config keys and works correctly.
+        # Adding MoE keys interferes with vllm's normal quantization detection and weight loading.
+        # Only add keys for non-MoE layers (attention, shared_expert, etc.)
+        _HF_PREFIX = "model.language_model."
+        # Skip MoE-related tensors. The original model has 0 MoE-related extra_config keys.
+        # We need to skip:
+        # - mlp.experts (the MoE layer itself)
+        # - mlp.experts.N.gate_proj/up_proj/down_proj (individual expert weights)
+        # - mlp.gate_proj/mlp.up_proj/mlp.down_proj (when not under shared_expert)
+        # But allow:
+        # - mlp.shared_expert.gate_proj/up_proj/down_proj
+        # - mlp.shared_expert_gate
+        _MOE_SKIP_PATTERNS = ("mlp.experts",)
+        _MOE_PROJ_PATTERNS = ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
 
         for idx in layer_indices:
             prefix = _layer_prefix(idx)
@@ -661,6 +843,14 @@ def update_quantization_config(
                     tensor_name.startswith(prefix)
                     and not _is_quantized_tensor(tensor_name, prefix)
                 ):
+                    # Skip MoE-related tensors (experts, gate_up_proj, down_proj, etc.)
+                    # The original model has no MoE extra_config keys and works correctly
+                    if any(keyword in tensor_name for keyword in _MOE_SKIP_PATTERNS):
+                        continue
+                    # Skip mlp.gate_proj/mlp.up_proj/mlp.down_proj unless they're under shared_expert
+                    if any(proj in tensor_name for proj in _MOE_PROJ_PATTERNS):
+                        if "shared_expert" not in tensor_name:
+                            continue
                     # Skip norms and other non-linear params (they're always FP16)
                     if any(
                         skip in tensor_name
@@ -674,15 +864,33 @@ def update_quantization_config(
                         if layer_key.endswith(suffix):
                             layer_key = layer_key[: -len(suffix)]
                             break
-                    # Remove any old entry with .weight suffix (cleanup from previous runs)
-                    if tensor_name in extra_config:
-                        del extra_config[tensor_name]
-                    # Add/update entry in extra_config
+                    # Keep key in HuggingFace format - vLLM's mapper will transform it
+                    # HF: model.language_model.layers.X.mlp.shared_expert.gate_proj
+                    # vLLM mapper transforms to: language_model.model.layers.X.mlp.shared_expert.gate_proj
+                    # Add/update entry in extra_config (keep in HF format)
+                    # Note: Old vLLM format keys are already cleaned up at the start of this function
                     if layer_key not in extra_config or (
                         isinstance(extra_config.get(layer_key), dict)
                         and extra_config[layer_key].get("bits", 16) != 16
                     ):
                         extra_config[layer_key] = {"bits": 16, "data_type": "fp"}
+
+            # CRITICAL: Add MoE layer prefix key for substituted layers!
+            # vllm needs this key to detect the MoE layer as unquantized.
+            # Without this key, vllm detects the layer as quantized (via block_name_to_quantize)
+            # and creates quantized parameters (w13_qweight, w2_qweight) instead of
+            # unquantized parameters (w13_weight, w2_weight).
+            #
+            # Store in HF format so mapper transforms it to vLLM format:
+            # HF: model.language_model.layers.X.mlp.experts
+            # vLLM: language_model.model.layers.X.mlp.experts
+            moe_prefix_hf = f"model.language_model.layers.{idx}.mlp.experts"
+            if moe_prefix_hf not in extra_config:
+                extra_config[moe_prefix_hf] = {"bits": 16, "data_type": "fp"}
+
+        # We add extra_config keys for SUBSTITUTED layers (with bits=16)
+        # to tell vllm they're unquantized. Non-substituted layers are left
+        # alone so vllm detects them as quantized normally.
 
         quant_config["extra_config"] = extra_config
 
@@ -698,22 +906,29 @@ def update_quantization_config(
         with open(config_json_path) as f:
             model_config: dict[str, Any] = json.load(f)
 
-        # Merge our extra_config and dynamic entries into config.json's quantization_config
+        # Merge our extra_config into config.json's quantization_config.
+        # Keep quant_method as "auto-round" (INC format) — do NOT change to
+        # "auto_gptq" as that requires a different config file name.
         model_qc = model_config.get("quantization_config", {})
         if model_qc:
             model_ec = model_qc.get("extra_config", {})
             if not isinstance(model_ec, dict):
                 model_ec = {}
             # Update with our substitutions (bits=16 entries win)
+            # Remove old vLLM format MoE keys that may be left from previous runs
+            # These interfere with vllm's normal quantization detection
+            old_vllm_keys = [k for k in model_ec.keys() if k.startswith("language_model.model.layers.") and "mlp.experts" in k]
+            for key in old_vllm_keys:
+                del model_ec[key]
+            # Now merge our extra_config (which has HF format keys)
             model_ec.update(quant_config.get("extra_config", {}))
             model_qc["extra_config"] = model_ec
-            # Set quant_method to auto_gptq (not auto-round/INC)
-            model_qc["quant_method"] = "auto_gptq"
-            # auto_gptq requires desc_act (auto-round doesn't use it)
-            if "desc_act" not in model_qc or model_qc["desc_act"] is None:
-                model_qc["desc_act"] = False
-            # Add dynamic config for MoE layer exclusions
-            model_qc["dynamic"] = quant_config.get("dynamic", {})
+            # Clean up auto_gptq artifacts from previous runs
+            model_qc.pop("desc_act", None)
+            model_qc.pop("dynamic", None)
+            # Ensure quant_method stays as auto-round (not auto_gptq)
+            if model_qc.get("quant_method") == "auto_gptq":
+                model_qc["quant_method"] = "auto-round"
             model_config["quantization_config"] = model_qc
 
             with open(config_json_path, "w") as f:

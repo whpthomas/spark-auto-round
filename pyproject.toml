@@ -14,8 +14,6 @@ dependencies = [
     "transformers>=4.40",
     "accelerate",
     "datasets",
-    "sentencepiece",
-    "protobuf",
     "numpy",
     "tqdm",
     "packaging",
@@ -26,6 +24,9 @@ dependencies = [
     "pydantic",
     "flash-linear-attention>=0.3.0",
     "causal-conv1d>=1.4.0",
+    "pandas",
+    "requests",
+    "pillow",
 ]
 
 [project.optional-dependencies]
