@@ -1,0 +1,48 @@
+# docker compose run --rm sar Qwen/Qwen3.6-27B
+#
+# Builds the image from the local Dockerfile and runs spark-auto-round with
+# the GB10 attached. Arguments after the service name are forwarded straight
+# to the CLI (ENTRYPOINT is spark-auto-round).
+#
+# Examples:
+#   docker compose build
+#   docker compose run --rm sar Qwen/Qwen3.6-27B
+#   docker compose run --rm sar Qwen/Qwen3.5-122B-A10B --iters 200 --nsamples 128
+#
+# Override via environment variables or a .env file:
+#   SAR_IMAGE, MODELS_DIR, HF_CACHE, HF_HUB_OFFLINE, TRANSFORMERS_OFFLINE
+
+services:
+  sar:
+    build:
+      context: .
+      args:
+        SAR_IMAGE: ${SAR_IMAGE:-nvcr.io/nvidia/pytorch:25.11-py3}
+    image: spark-auto-round:local
+
+    # Shared memory for calibration dataloaders.
+    ipc: host
+
+    # Attach the GB10. Requires the NVIDIA Container Toolkit on the host.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    working_dir: /workspace
+
+    volumes:
+      # Quantised output. The CLI defaults to ./models (i.e. /workspace/models)
+      # so results survive the container exiting.
+      - ${MODELS_DIR:-${HOME}/models}:/workspace/models
+      # HuggingFace cache so weights are not re-downloaded each run.
+      - ${HF_CACHE:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+      # Development: uncomment to mount source for live edits via editable install.
+      # - ./:/opt/spark-auto-round
+
+    environment:
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
+      - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}

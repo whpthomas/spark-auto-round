@@ -48,18 +48,37 @@ To run comparative benchmarks and compare and contrast quantized models we need 
 
 ## Installation
 
+### Docker (recommended)
+
+Easy way to get an environment set up on DGX spark without installing dependencies into the host system.
+
+
+**Prerequisites:** Docker and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
+
 ```bash
-# Create environment
-python -m venv .venv
-source .venv/bin/activate
-
-# Install from GitHub
-uv pip install git+https://github.com/whpthomas/spark-auto-round.git
-
-# Or for development
 git clone https://github.com/whpthomas/spark-auto-round.git
 cd spark-auto-round
-uv pip install -e .
+docker compose build
+docker compose run --rm sar Qwen/Qwen3.6-27B
+```
+
+Quantised output lands in `~/models/` on the host. The HuggingFace cache is persisted to `~/.cache/huggingface/` so weights are not re-downloaded between runs. Both paths are configurable via `MODELS_DIR` and `HF_CACHE` environment variables (or a `.env` file).
+
+To use a different NGC PyTorch image (e.g. a newer monthly tag):
+
+```bash
+SAR_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3 docker compose build
+```
+
+### Host venv (advanced)
+
+A host venv requires manual CUDA wrangling: you must install torch from the `cu130` index, set `CUDA_HOME`, and install `causal-conv1d` with `--no-build-isolation`. Only use this if you have a reason to avoid Docker.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cu130
+CUDA_HOME=/usr/local/cuda pip install --no-build-isolation -e .
 ```
 
 ## Quick Start

@@ -1,0 +1,18 @@
+.git
+.venv
+venv
+__pycache__
+*.egg-info
+dist
+build
+.pytest_cache
+
+# Generated output — large and should come from mounted volumes
+models/
+compressed_models/
+test/tmp/
+
+# HuggingFace cache — comes from mounted volumes
+.cache/
+
+thoughts/
