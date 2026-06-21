@@ -10,6 +10,8 @@ setup(
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.4",
+        "torchvision>=0.19",
+        "triton>=3.0",
         "transformers>=4.40",
         "datasets",
         "safetensors",

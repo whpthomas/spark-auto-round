@@ -17,8 +17,10 @@ This is new software under active development. I am working my way up from Qwen 
 | Qwen 3.5 0.8b      | ✔︎ | 67 |
 | Qwen 3.6 27b       | ✔︎ | 92 |
 | Qwen 3.6 35b a3b   | ✔︎ | 92 |
-| Qwen 3.5 122b a10b |   |    |
+| Qwen 3.5 122b a10b | ✔︎ +|    |
 | Gemma 4 12b        |   |    |
+
+*+ sample of layers tested only*
 
 ## What is this?
 
