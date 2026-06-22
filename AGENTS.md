@@ -20,6 +20,26 @@ uv pip install -e .          # editable install
 | CUDA-specific tests only | `pytest test/test_cuda/ -v` |
 | Single test | `pytest test/test_cuda/quantization/test_asym.py::TestAutoRoundAsym::test_asym_group_size -v` |
 | Filter by keyword | `pytest -k "torch_compile" -v` |
+| Tests in container (against shipped NGC stack) | see below |
+
+### Running tests in the container
+
+The NGC image (`spark-auto-round:local`) already ships `pytest`, `transformers`,
+and `torch` — no `[test]` extra needed for CPU-only suites. Mount the live source
+tree over the editable-install path so you test current changes without rebuilding
+the ~20 GB image:
+
+```sh
+docker run --rm --entrypoint bash \
+  -v "$PWD":/opt/spark-auto-round \
+  -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
+  -w /opt/spark-auto-round \
+  spark-auto-round:local \
+  -c "python -m pytest test/test_resume.py -q"
+```
+
+CPU-only tests (e.g. `test_resume.py`) need no GPU reservation, so plain
+`docker run` is simpler than `docker compose run`.
 
 **No linting, typecheck, formatter, or CI workflows are configured.** There is no `Makefile`, `.github/` directory, or pre-commit hooks.
 
