@@ -483,6 +483,19 @@ class DataDrivenCompressor(BaseCompressor):
                     q_input = payload["q_input"]
                     input_others = payload["input_others"]
                     checkpointer.restore_rng(payload)
+                    # Reassemble ShardWriter progress so finalize() emits the
+                    # blocks tuned by the prior run alongside the new ones.
+                    if (
+                        self.compress_context.is_immediate_saving
+                        and self.shard_writer is not None
+                        and payload.get("shard_state") is not None
+                    ):
+                        self.shard_writer.restore_state(payload["shard_state"])
+                        # The completed blocks live on disk as packed qweight;
+                        # stop finalize() re-adding their unpacked in-memory floats.
+                        self.shard_writer._resume_skip_prefixes = set(
+                            block_names[: completed + 1]
+                        )
                     resume_start = completed + 1
                     logger.info(
                         f"[resume] resuming from block {resume_start} "
@@ -651,8 +664,19 @@ class DataDrivenCompressor(BaseCompressor):
             # ── Resume: record block-boundary activations after the block's
             #    weights have been written, then honour a stop request. ────────
             if checkpointer.active:
+                # Flush this block's weights to disk and snapshot the writer
+                # state *before* recording the checkpoint, so a checkpointed
+                # block is always a fully-persisted block.
+                shard_state = None
+                if self.compress_context.is_immediate_saving and self.shard_writer is not None:
+                    self.shard_writer.flush_pending()
+                    shard_state = self.shard_writer.export_state()
                 checkpointer.save(
-                    i, input_ids=input_ids, q_input=q_input, input_others=input_others
+                    i,
+                    input_ids=input_ids,
+                    q_input=q_input,
+                    input_others=input_others,
+                    shard_state=shard_state,
                 )
             if checkpointer.should_stop(i):
                 raise StopAfterBlock(i)

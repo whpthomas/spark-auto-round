@@ -166,6 +166,93 @@ def _assert_activations_equal(payload_a, payload_b, idx):
             )
 
 
+def _run_quantize_and_save(model_path, resume_dir, output_dir, dataset, stop_after=None):
+    """Run a quantize+save pass with immediate-saving (offload) enabled.
+    Returns the saved-model folder, or None if it stopped before finalizing."""
+    from auto_round import AutoRound
+
+    old = {k: os.environ.get(k) for k in ("AR_RESUME_DIR", "AR_STOP_AFTER_BLOCK")}
+    os.environ.pop("AR_STOP_AFTER_BLOCK", None)
+    if resume_dir is not None:
+        os.environ["AR_RESUME_DIR"] = resume_dir
+    else:
+        os.environ.pop("AR_RESUME_DIR", None)
+    if stop_after is not None:
+        os.environ["AR_STOP_AFTER_BLOCK"] = str(stop_after)
+    try:
+        ar = AutoRound(
+            model=model_path,
+            scheme="W4A16",
+            dataset=dataset,
+            iters=ITERS,
+            seqlen=SEQLEN,
+            nsamples=NSAMPLES,
+            batch_size=1,
+            group_size=GROUP_SIZE,
+            low_gpu_mem_usage=False,
+            low_cpu_mem_usage=True,  # triggers is_immediate_saving (sharded write)
+            device_map="cpu",
+            enable_torch_compile=False,
+            seed=42,
+        )
+        _, folders = ar.quantize_and_save(output_dir, format="auto_round")
+        return folders[0] if isinstance(folders, (list, tuple)) else folders
+    except StopAfterBlock:
+        return None
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _load_all_weights(folder):
+    import glob
+
+    from safetensors.torch import load_file
+
+    weights = {}
+    for f in sorted(glob.glob(os.path.join(folder, "*.safetensors"))):
+        weights.update(load_file(f))
+    return weights
+
+
+def test_resume_assembles_identical_model(tiny_model_path, tmp_path):
+    """A stop-then-resume run, with immediate-saving on, assembles a final
+    model whose saved weights match an uninterrupted run bit-for-bit."""
+    from transformers import AutoConfig
+
+    vocab_size = AutoConfig.from_pretrained(tiny_model_path).vocab_size
+    dataset = _make_dataset(vocab_size)
+
+    # Reference: a normal, uninterrupted run (no resume env at all).
+    ref_out = str(tmp_path / "ref_out")
+    ref_folder = _run_quantize_and_save(tiny_model_path, None, ref_out, dataset)
+    assert ref_folder is not None
+    ref_weights = _load_all_weights(ref_folder)
+    assert ref_weights, "reference run produced no safetensors weights"
+
+    # Resume: interrupt after block 1, then finish in a fresh pass.
+    scratch = str(tmp_path / "scratch")
+    res_out = str(tmp_path / "res_out")
+    stopped = _run_quantize_and_save(tiny_model_path, scratch, res_out, dataset, stop_after=1)
+    assert stopped is None  # stopped before finalize
+    res_folder = _run_quantize_and_save(tiny_model_path, scratch, res_out, dataset)
+    assert res_folder is not None
+    res_weights = _load_all_weights(res_folder)
+
+    # The assembled weight sets must be identical.
+    assert set(res_weights) == set(ref_weights), (
+        f"key mismatch: only-in-ref={set(ref_weights) - set(res_weights)}, "
+        f"only-in-resumed={set(res_weights) - set(ref_weights)}"
+    )
+    for key in ref_weights:
+        a, b = ref_weights[key], res_weights[key]
+        assert a.shape == b.shape, f"{key}: shape {a.shape} vs {b.shape}"
+        assert torch.equal(a, b), f"{key}: weights diverged between reference and resumed run"
+
+
 def test_resume_reproduces_clean_trajectory(tiny_model_path, tmp_path):
     """Resuming from a mid-run checkpoint yields the same downstream block
     activations as an uninterrupted run."""

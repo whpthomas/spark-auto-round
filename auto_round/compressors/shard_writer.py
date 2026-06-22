@@ -95,6 +95,11 @@ class ShardWriter:
         # Maintained incrementally in _flush_shard to avoid O(N^2) rebuilds in _add_tensor.
         self._all_saved = set()
 
+        # Module-name prefixes whose params were saved by a prior (resumed) run.
+        # Their in-memory copies are unpacked floats, so finalize() must not
+        # re-add them under their float names — skip the whole subtree.
+        self._resume_skip_prefixes = set()
+
         # Stats
         self.total_param_elems = 0
         self.total_param_size_bytes = 0
@@ -201,6 +206,13 @@ class ShardWriter:
         return list(expanded.items())
 
     def _add_tensor(self, name: str, tensor: torch.Tensor):
+        # Params under a resumed-run's completed blocks are already on disk
+        # (as packed qweight); their in-memory float copies must not be saved.
+        if self._resume_skip_prefixes and any(
+            name == p or name.startswith(p + ".") for p in self._resume_skip_prefixes
+        ):
+            return
+
         if isinstance(tensor, torch.Tensor) and tensor.device.type == "meta":
             self.skipped_meta_tensors.append(name)
             return
@@ -370,6 +382,51 @@ class ShardWriter:
                 json.dump(index_data, f, indent=2)
 
         logger.info(f"model has been saved to {self.output_dir}")
+
+    def flush_pending(self):
+        """Force the in-progress shard to disk.
+
+        Used by resumable quantization to guarantee a block's weights are
+        persisted *before* its activation checkpoint is recorded, so a crash
+        after the checkpoint never loses tuned weights.  No-op if nothing is
+        pending.
+        """
+        self._flush_shard()
+
+    def export_state(self) -> dict:
+        """Snapshot the serializable writer state for a resume checkpoint.
+
+        Call only after :meth:`flush_pending`, so ``current_shard_tensors`` is
+        empty and all progress lives in ``shard_meta`` / ``_all_saved`` /
+        counters.  The shard *files* themselves already sit in ``output_dir``.
+        """
+        return {
+            "shard_counter": self.shard_counter,
+            "shard_meta": [dict(meta) for meta in self.shard_meta],
+            "all_saved": list(self._all_saved),
+            "total_param_elems": int(self.total_param_elems),
+            "total_param_size_bytes": int(self.total_param_size_bytes),
+        }
+
+    def restore_state(self, state: dict) -> None:
+        """Restore writer state captured by :meth:`export_state` on resume.
+
+        The shard files referenced by ``shard_meta`` are expected to still be on
+        disk (the prior run flushed them and never finalized, so they keep their
+        temporary names).  Subsequent blocks append new shards; ``finalize``
+        then renames and indexes the combined set.
+        """
+        self.shard_counter = state["shard_counter"]
+        self.shard_meta = [dict(meta) for meta in state["shard_meta"]]
+        self._all_saved = set(state["all_saved"])
+        self.total_param_elems = state["total_param_elems"]
+        self.total_param_size_bytes = state["total_param_size_bytes"]
+        self.current_shard_tensors = OrderedDict()
+        self.current_shard_size = 0
+        logger.info(
+            f"[resume] restored ShardWriter: {self.shard_counter} shard(s), "
+            f"{len(self._all_saved)} params already saved."
+        )
 
     @torch.no_grad()
     def write(self, m: torch.nn.Module = None, name: str = None, is_finalize: bool = False):

@@ -155,8 +155,15 @@ class BlockCheckpointer:
         return cls(resume_dir=resume_dir, stop_after_block=stop_after)
 
     # ── Write side ─────────────────────────────────────────────────────────
-    def save(self, block_index: int, *, input_ids, q_input, input_others) -> None:
-        """Persist the activations entering block ``block_index + 1``."""
+    def save(
+        self, block_index: int, *, input_ids, q_input, input_others, shard_state=None
+    ) -> None:
+        """Persist the activations entering block ``block_index + 1``.
+
+        ``shard_state`` is the optional ShardWriter snapshot (from
+        ``ShardWriter.export_state()``) needed to reassemble the final model on
+        resume when immediate-saving is active.
+        """
         if not self.active:
             return
         payload = {
@@ -165,6 +172,7 @@ class BlockCheckpointer:
             "q_input": _to_cpu(q_input),
             "input_others": _to_cpu(input_others),
             "rng_state": _capture_rng_state(),
+            "shard_state": shard_state,
         }
         # Write to a temp file then rename so a kill mid-write never leaves a
         # half-written checkpoint that resume would later trust.
