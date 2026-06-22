@@ -1,9 +1,9 @@
 # TODO/FIXME Registry
 
 Living document of unresolved TODO/FIXME comments in the spark-auto-round codebase.
-All items are from upstream auto-round/GPTQModel. None were authored for this fork.
+Most items are from upstream auto-round/GPTQModel; fork-authored items are marked.
 
-**Last updated**: 2026-06-18
+**Last updated**: 2026-06-22
 
 ---
 
@@ -45,6 +45,19 @@ All items are from upstream auto-round/GPTQModel. None were authored for this fo
 **Current state**: Code handles the edge case correctly. Root cause uninvestigated.
 
 **Action**: Low priority. Works in practice.
+
+---
+
+### 8. Resumable quantization assumes `nblocks == 1` (fork-authored)
+
+**File**: `auto_round/compressors/data_driven.py:466`
+**Guard**: `if checkpointer.active and nblocks != 1: ... checkpointer.active = False`
+
+**What it does**: The resume/checkpoint feature keys checkpoints by single-block index, derives `latest_completed_index()` from contiguous `block_NNNNNN.pt` files, and computes ShardWriter skip-prefixes via `block_names[:completed + 1]` — all of which assume one block per loop step. When `nblocks > 1` the loop steps by `nblocks` and each step covers a block *group*, breaking that 1:1 mapping. The guard disables resume (with a warning) rather than corrupt checkpoints.
+
+**Current state**: Not reachable from the CLI — `nblocks=1` is hardcoded in the `AutoRound()` call (`auto_round/__main__.py:257`); there is no `--nblocks` flag. The guard only fires for direct Python-API callers passing `nblocks > 1` plus resume. Safe degradation, no corruption.
+
+**Action**: If a `--nblocks` CLI flag is ever added, lift the restriction: key checkpoints by block-group start index, step `latest_completed_index()` arithmetic by `nblocks`, and widen the skip-prefix slice to cover all blocks in completed groups. Add a multiblock resume test. Until then, keep the guard. (See also the hardcoded `nblocks=1` at `__main__.py:257`.)
 
 ---
 
@@ -102,8 +115,8 @@ All items are from upstream auto-round/GPTQModel. None were authored for this fo
 
 | Priority | Count | Status |
 |----------|-------|--------|
-| Low — may revisit | 3 | Documented, leave as-is |
+| Low — may revisit | 4 | Documented, leave as-is (incl. 1 fork-authored: resume nblocks==1) |
 | Upstream — not actionable | 4 | Leave as-is |
-| **Total** | **7** | |
+| **Total** | **8** | |
 
 **Deleted during cleanup (2026-06-18)**: 11 items (5 dead code, 2 converted to NOTE, 1 TODO removed keep line, 1 multi-GPU TP plan, 2 stale)
