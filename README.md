@@ -143,6 +143,9 @@ spark-auto-round Qwen/Qwen3.5-122B-A10B \
 # Disable torch.compile (if causing issues)
 spark-auto-round Qwen/Qwen3.6-35B-A3B --disable_torch_compile
 
+# Resumable run — checkpoint after each block so a killed/OOMed job can restart
+spark-auto-round Qwen/Qwen3.5-122B-A10B --resume
+
 # Perform adaptive sensitivity-aware quantization
 spark-asaq-substitute Qwen/Qwen3.6-27B
 ```
@@ -166,6 +169,8 @@ spark-auto-round <model> [options]
 | `--output_dir` | ./models | Output directory |
 | `--dataset` | opencode-instruct | Calibration dataset |
 | `--disable_torch_compile` | (disabled) | Disable torch.compile (enabled by default) |
+| `--resume` | false | Checkpoint after each block; resume a killed run (see [Resumable quantization](#resumable-quantization)) |
+| `--resume-dir` | `<output_dir>/.resume/<model>` | Override the checkpoint directory (implies `--resume`) |
 
 ### Tuning Arguments
 
@@ -190,6 +195,24 @@ spark-auto-round <model> [options]
 | `--seed` | 42 | Random seed |
 | `--adam` | false | Use Adam optimizer |
 | `--mllm` | false | Force multimodal mode |
+
+## Resumable quantization
+
+Large models tuned block-by-block can take hours; an OOM, crash, or preemption part-way means starting over. `--resume` checkpoints the block-boundary state (the activations entering the next block, plus RNG state) after each block. If a run dies, re-running the identical command picks up from the last completed block instead of block 0.
+
+```bash
+# first attempt — killed by OOM after a few blocks
+spark-auto-round Qwen/Qwen3.5-122B-A10B --resume
+# just run it again — resumes from the last checkpointed block
+spark-auto-round Qwen/Qwen3.5-122B-A10B --resume
+```
+
+- **Where checkpoints live.** `<output_dir>/.resume/<model>` by default — under the output directory so, in the Docker setup, they sit on the mounted models volume and survive a container restart. Namespaced by model so different models never collide. Override with `--resume-dir`.
+- **Cleanup.** On a successful finish the checkpoints are deleted automatically; they are only kept across a *failed* run so the next invocation can resume.
+- **Settings guard.** Resuming with changed tuning parameters (iters, group_size, dataset, …) is refused — a run-signature mismatch aborts rather than splicing together blocks tuned under incompatible configs. Remove the resume directory (or use a fresh `--resume-dir`) to start over.
+- **Mechanics.** `--resume` enables per-block immediate-saving (each block is packed and flushed to disk as it finishes), so it works for any model — including ones small enough to otherwise fit in memory — at the cost of some extra per-block disk I/O.
+
+**Verification.** Resume was validated end-to-end on GPU with the dense *Qwen 3.5 0.8B* model: a run was interrupted after layer 1 and resumed. The resumed model's per-layer quantization quality (cosine-to-original, PSNR, loss reduction in the quantization report) matched an uninterrupted run across every layer — including all layers tuned after the resume point — to within normal run-to-run nondeterminism (FlashAttention's non-deterministic backward; note that exact weight bits differ between any two GPU runs because discrete rounding amplifies that nondeterminism, while quantization *quality* is unchanged).
 
 ## Datasets
 
