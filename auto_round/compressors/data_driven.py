@@ -457,7 +457,39 @@ class DataDrivenCompressor(BaseCompressor):
             for k in extra_keys:
                 input_others[k] = input_ids.pop(k)
 
-        for i in range(0, len(block_names), nblocks):
+        # ── Resume: checkpoint block-boundary activations, optionally skip
+        #    already-tuned blocks, and support a clean stop-after-block. ──────
+        from auto_round.utils.resume import BlockCheckpointer, StopAfterBlock
+
+        checkpointer = BlockCheckpointer.from_env()
+        resume_start = 0
+        if checkpointer.active and nblocks != 1:
+            logger.warning(
+                "[resume] checkpointing is only supported with nblocks == 1; "
+                f"got nblocks={nblocks}. Disabling resume for this run."
+            )
+            checkpointer.active = False
+        if checkpointer.active:
+            completed = checkpointer.latest_completed_index()
+            if completed is not None:
+                if completed >= len(block_names) - 1:
+                    logger.info(
+                        "[resume] all blocks already checkpointed; nothing to tune."
+                    )
+                    resume_start = len(block_names)
+                else:
+                    payload = checkpointer.load(completed)
+                    input_ids = payload["input_ids"]
+                    q_input = payload["q_input"]
+                    input_others = payload["input_others"]
+                    checkpointer.restore_rng(payload)
+                    resume_start = completed + 1
+                    logger.info(
+                        f"[resume] resuming from block {resume_start} "
+                        f"(blocks 0..{completed} already tuned)."
+                    )
+
+        for i in range(resume_start, len(block_names), nblocks):
             if input_others_extra_blocks and block_names[i] in input_others_extra_blocks:
                 input_others = input_others_extra_blocks[block_names[i]]
                 _, input_others = self._preprocess_block_inputs(input_others)
@@ -615,6 +647,15 @@ class DataDrivenCompressor(BaseCompressor):
                         best_iter=_tune_result.get("best_iter", 0),
                         total_iters=_tune_result.get("total_iters", 0),
                     )
+
+            # ── Resume: record block-boundary activations after the block's
+            #    weights have been written, then honour a stop request. ────────
+            if checkpointer.active:
+                checkpointer.save(
+                    i, input_ids=input_ids, q_input=q_input, input_others=input_others
+                )
+            if checkpointer.should_stop(i):
+                raise StopAfterBlock(i)
 
 
         if not self.compress_context.is_immediate_saving:
