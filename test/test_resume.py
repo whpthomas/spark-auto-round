@@ -137,6 +137,16 @@ class TestResumeCLI:
         qs = source.index("quantize_and_save(")
         assert source.index(".cleanup()") > qs, "cleanup must run after quantize_and_save"
 
+    def test_tune_forces_immediate_saving_on_resume(self):
+        # Resume needs the immediate-saving path even when the model fits, so
+        # tune() must OR resume into low_cpu_mem_usage.
+        import inspect
+
+        import auto_round.__main__ as main_mod
+
+        source = inspect.getsource(main_mod.tune)
+        assert "low_cpu_mem_usage = use_offload or resume_requested" in source
+
 
 class TestCheckpointerCleanup:
     def test_cleanup_removes_checkpoints(self, tmp_path):
@@ -203,7 +213,10 @@ def _make_dataset(vocab_size):
 
 def _run_quantize(model_path, resume_dir, dataset, stop_after=None):
     """Run one quantization pass with resume env configured. Returns the block
-    index the run stopped after, or None if it completed."""
+    index the run stopped after, or None if it completed.
+
+    Resume only engages under immediate-saving, so this runs the offload path
+    (low_cpu_mem_usage=True) and saves to a per-resume-dir output folder."""
     from auto_round import AutoRound
 
     env = {"AR_RESUME_DIR": resume_dir}
@@ -223,12 +236,12 @@ def _run_quantize(model_path, resume_dir, dataset, stop_after=None):
             batch_size=1,
             group_size=GROUP_SIZE,
             low_gpu_mem_usage=False,
-            low_cpu_mem_usage=False,
+            low_cpu_mem_usage=True,  # immediate-saving: resume's required path
             device_map="cpu",
             enable_torch_compile=False,
             seed=42,
         )
-        ar.quantize()
+        ar.quantize_and_save(resume_dir + "_model", format="auto_round")
         return None
     except StopAfterBlock as e:
         return e.block_index
@@ -342,6 +355,41 @@ def test_resume_assembles_identical_model(tiny_model_path, tmp_path):
         a, b = ref_weights[key], res_weights[key]
         assert a.shape == b.shape, f"{key}: shape {a.shape} vs {b.shape}"
         assert torch.equal(a, b), f"{key}: weights diverged between reference and resumed run"
+
+
+def test_resume_disabled_in_whole_model_mode(tiny_model_path, tmp_path):
+    """When the model fits in memory (no immediate-saving), resume must disable
+    itself: no checkpoints written, and the run completes + saves cleanly.
+    Without the guard, skipped blocks crash the packer ('no attribute scale')."""
+    from transformers import AutoConfig
+
+    vocab_size = AutoConfig.from_pretrained(tiny_model_path).vocab_size
+    dataset = _make_dataset(vocab_size)
+
+    scratch = str(tmp_path / "scratch")
+    out = str(tmp_path / "out")
+    os.environ["AR_RESUME_DIR"] = scratch
+    os.environ.pop("AR_STOP_AFTER_BLOCK", None)
+    try:
+        from auto_round import AutoRound
+
+        ar = AutoRound(
+            model=tiny_model_path, scheme="W4A16", dataset=dataset, iters=ITERS,
+            seqlen=SEQLEN, nsamples=NSAMPLES, batch_size=1, group_size=GROUP_SIZE,
+            low_gpu_mem_usage=False, low_cpu_mem_usage=False,  # whole-model mode
+            device_map="cpu", enable_torch_compile=False, seed=42,
+        )
+        _, folders = ar.quantize_and_save(out, format="auto_round")
+    finally:
+        os.environ.pop("AR_RESUME_DIR", None)
+
+    folder = folders[0] if isinstance(folders, (list, tuple)) else folders
+    weights = _load_all_weights(folder)
+    assert weights, "whole-model-mode run produced no weights"
+    # Resume disabled → no checkpoints written.
+    assert not (os.path.isdir(scratch) and any(
+        f.startswith("block_") for f in os.listdir(scratch)
+    )), "resume should not write checkpoints in whole-model mode"
 
 
 def test_resume_reproduces_clean_trajectory(tiny_model_path, tmp_path):

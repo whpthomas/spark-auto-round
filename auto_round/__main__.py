@@ -234,6 +234,21 @@ def tune(args):
     # and load blocks on demand during quantization.
     use_meta_device = use_offload
 
+    # Resume requires the immediate-saving (block-offload) path: blocks must be
+    # packed and flushed to disk per block so a resumed process can reassemble
+    # them. Force low_cpu_mem_usage on when resuming even if the model would fit
+    # in memory. Meta-device loading is left to the genuine memory estimate —
+    # only the per-block save path is needed for resume, not zero-memory load.
+    # (Trade-off: extra per-block disk I/O during tuning; the cost of being
+    # resumable, opted into via --resume.)
+    resume_requested = bool(os.environ.get("AR_RESUME_DIR"))
+    low_cpu_mem_usage = use_offload or resume_requested
+    if resume_requested and not use_offload:
+        logger.info(
+            "  ** RESUME: enabling per-block immediate-saving (model fits in "
+            "memory but resume needs blocks flushed to disk as they finish) **"
+        )
+
     from auto_round import AutoRound
 
     from auto_round.compressors.config import SARConfig
@@ -288,7 +303,7 @@ def tune(args):
         batch_size=args.batch_size,
         gradient_accumulate_steps=1,
         low_gpu_mem_usage=False,
-        low_cpu_mem_usage=use_offload,
+        low_cpu_mem_usage=low_cpu_mem_usage,
         device_map=device_map,
         enable_torch_compile=enable_torch_compile,
         seed=args.seed,

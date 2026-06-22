@@ -469,6 +469,19 @@ class DataDrivenCompressor(BaseCompressor):
                 f"got nblocks={nblocks}. Disabling resume for this run."
             )
             checkpointer.active = False
+        if checkpointer.active and not self.compress_context.is_immediate_saving:
+            # Resume needs immediate-saving so each block is packed and flushed
+            # to disk as it finishes; otherwise the model is held whole in memory
+            # and packed at the end, where skipped blocks crash the packer (no
+            # scale). The CLI force-enables immediate-saving when resuming, so
+            # this only fires when something else disabled it (e.g. tied weights,
+            # non-int dtype, or no output_dir) — in which case resume can't work.
+            logger.warning(
+                "[resume] disabled: immediate-saving is not active (blocked by "
+                "tied weights, a non-int dtype, or a missing output_dir). Resume "
+                "requires per-block saving to reassemble the model."
+            )
+            checkpointer.active = False
         if checkpointer.active:
             # Refuse to resume across changed tuning settings (model collisions
             # are already handled by the namespaced dir; this guards the same
