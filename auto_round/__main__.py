@@ -97,6 +97,24 @@ class BasicArgumentParser(argparse.ArgumentParser):
             help="Run the full init pipeline except quantization tuning; "
                  "write config files only for inspection.",
         )
+        basic.add_argument(
+            "--resume",
+            action="store_true",
+            default=False,
+            help="Enable resumable quantization: checkpoint block-boundary state "
+                 "after each block so a killed/OOMed run can restart without "
+                 "re-tuning completed blocks. Checkpoints default to "
+                 "<output_dir>/.resume (override with --resume-dir). If "
+                 "checkpoints already exist there, the run resumes automatically.",
+        )
+        basic.add_argument(
+            "--resume-dir",
+            default=None,
+            type=str,
+            help="Directory for resume checkpoints (implies --resume). Defaults to "
+                 "<output_dir>/.resume so it sits under the mounted output volume "
+                 "and survives container restarts.",
+        )
 
         tuning = self.add_argument_group("Tuning Arguments")
         tuning.add_argument(
@@ -159,6 +177,26 @@ def tune(args):
     )
     if args.dry_run:
         logger.info("  ** DRY-RUN mode: will skip quantization, write config files only **")
+
+    # --- Resumable quantization ---
+    # Translate the CLI flags into AR_RESUME_DIR, which the quantization loop
+    # reads via BlockCheckpointer.from_env(). Default the checkpoint dir under
+    # output_dir so it lives in the mounted volume and survives a container
+    # restart (the partial shards land in output_dir too, which the resume
+    # append path requires to be stable across runs).
+    #
+    # Namespace the default dir by model name: a shared .resume dir would let a
+    # different model pick up stale checkpoints and resume onto the wrong
+    # activations. An explicit --resume-dir is used verbatim (caller's choice).
+    if args.resume or args.resume_dir:
+        if args.resume_dir:
+            resume_dir = args.resume_dir
+        else:
+            model_stem = os.path.basename(args.model.rstrip("/")) or "model"
+            resume_dir = os.path.join(args.output_dir, ".resume", model_stem)
+        os.makedirs(resume_dir, exist_ok=True)
+        os.environ["AR_RESUME_DIR"] = resume_dir
+        logger.info(f"  ** RESUME mode: checkpoints in {resume_dir} **")
 
     # --- Hardcoded values for GB10 ---
     device_map = "cuda:0"
@@ -270,6 +308,17 @@ def tune(args):
     # Quantize and save
     model, folders = autoround.quantize_and_save(args.output_dir, format=format)
     tokenizer = autoround.tokenizer
+
+    # Success: drop the resume checkpoints. They are only kept across a failed
+    # run so the next invocation can resume; once the model is fully saved they
+    # waste disk and would make a re-run wrongly auto-resume. (On failure we
+    # never reach here, so the checkpoints survive.)
+    resume_env = os.environ.get("AR_RESUME_DIR")
+    if resume_env:
+        from auto_round.utils.resume import BlockCheckpointer
+
+        BlockCheckpointer(resume_dir=resume_env).cleanup()
+
     clear_memory()
 
 

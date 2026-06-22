@@ -92,6 +92,61 @@ class TestBlockCheckpointer:
         assert ckpt.stop_after_block is None
 
 
+# ── CLI flag wiring ────────────────────────────────────────────────────────
+class TestResumeCLI:
+    def test_parser_accepts_resume_flags(self):
+        from auto_round.__main__ import BasicArgumentParser
+
+        parser = BasicArgumentParser()
+        args = parser.parse_args(["some-model", "--resume", "--resume-dir", "/tmp/ckpt"])
+        assert args.resume is True
+        assert args.resume_dir == "/tmp/ckpt"
+
+    def test_parser_resume_defaults(self):
+        from auto_round.__main__ import BasicArgumentParser
+
+        parser = BasicArgumentParser()
+        args = parser.parse_args(["some-model"])
+        assert args.resume is False
+        assert args.resume_dir is None
+
+    def test_tune_sets_resume_env_namespaced_under_output_dir(self):
+        # tune() defaults the checkpoint dir under output_dir (mounted volume),
+        # namespaced by model name so different models don't collide.
+        import inspect
+
+        import auto_round.__main__ as main_mod
+
+        source = inspect.getsource(main_mod.tune)
+        assert 'os.path.join(args.output_dir, ".resume", model_stem)' in source
+        assert 'os.environ["AR_RESUME_DIR"]' in source
+
+    def test_tune_cleans_up_on_success(self):
+        import inspect
+
+        import auto_round.__main__ as main_mod
+
+        source = inspect.getsource(main_mod.tune)
+        # cleanup() is called after quantize_and_save returns (i.e. on success).
+        assert ".cleanup()" in source
+        qs = source.index("quantize_and_save(")
+        assert source.index(".cleanup()") > qs, "cleanup must run after quantize_and_save"
+
+
+class TestCheckpointerCleanup:
+    def test_cleanup_removes_checkpoints(self, tmp_path):
+        ckpt = BlockCheckpointer(resume_dir=str(tmp_path / "rd"))
+        for i in range(3):
+            ckpt.save(i, input_ids=[torch.zeros(1)], q_input=None, input_others={})
+        assert ckpt.latest_completed_index() == 2
+        ckpt.cleanup()
+        assert ckpt.latest_completed_index() is None
+        assert not os.path.isdir(str(tmp_path / "rd"))  # empty dir removed
+
+    def test_cleanup_inactive_noop(self):
+        BlockCheckpointer(resume_dir=None).cleanup()  # must not raise
+
+
 # ── Tier-1 seam test ───────────────────────────────────────────────────────
 @pytest.fixture(scope="module")
 def tiny_model_path():

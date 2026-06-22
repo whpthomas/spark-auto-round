@@ -222,3 +222,31 @@ class BlockCheckpointer:
     def restore_rng(payload: dict) -> None:
         """Restore RNG state captured in a checkpoint payload (no-op if absent)."""
         _restore_rng_state(payload.get("rng_state"))
+
+    # ── Teardown ───────────────────────────────────────────────────────────
+    def cleanup(self) -> None:
+        """Delete all block checkpoints and the resume dir if it ends up empty.
+
+        Call only after the run has fully succeeded — leftover checkpoints would
+        otherwise (a) waste disk (each holds a full set of block activations) and
+        (b) make a re-run of the same model wrongly auto-resume from a completed
+        run. On failure the checkpoints are intentionally kept so the next run
+        can resume.
+        """
+        if not self.active or not os.path.isdir(self.resume_dir):
+            return
+        removed = 0
+        for fname in os.listdir(self.resume_dir):
+            if _CKPT_RE.match(fname) or fname.endswith(".pt.tmp"):
+                try:
+                    os.remove(os.path.join(self.resume_dir, fname))
+                    removed += 1
+                except OSError:
+                    pass
+        # Remove the dir if we left it empty (don't clobber unrelated contents).
+        try:
+            if not os.listdir(self.resume_dir):
+                os.rmdir(self.resume_dir)
+        except OSError:
+            pass
+        logger.info(f"[resume] cleaned up {removed} checkpoint(s) from {self.resume_dir}")
