@@ -37,6 +37,8 @@ Two environment variables drive it:
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import random
 import re
@@ -47,6 +49,22 @@ import torch
 from auto_round.logger import logger
 
 _CKPT_RE = re.compile(r"^block_(\d{6})\.pt$")
+_MANIFEST_NAME = "manifest.json"
+
+
+class ResumeSignatureMismatch(Exception):
+    """Raised when resume checkpoints were produced with different settings.
+
+    Resuming across changed tuning parameters (iters, group_size, dataset, ...)
+    would silently splice together blocks tuned under incompatible configs, so
+    we refuse rather than corrupt the model.
+    """
+
+
+def compute_signature(params: dict) -> str:
+    """Stable SHA-256 over the run parameters that affect the output."""
+    canonical = json.dumps(params, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _capture_rng_state() -> dict:
@@ -154,6 +172,40 @@ class BlockCheckpointer:
         # but checkpoint persistence requires a dir.
         return cls(resume_dir=resume_dir, stop_after_block=stop_after)
 
+    # ── Signature guard ────────────────────────────────────────────────────
+    def verify_or_init_signature(self, params: dict) -> None:
+        """Write a run-signature manifest on first use, or verify it on resume.
+
+        Namespacing the dir by model prevents *cross-model* collisions; this
+        guards the orthogonal case of the *same* model re-run with different
+        tuning settings.  Raises :class:`ResumeSignatureMismatch` on mismatch.
+        """
+        if not self.active:
+            return
+        manifest_path = os.path.join(self.resume_dir, _MANIFEST_NAME)
+        sig = compute_signature(params)
+        if os.path.exists(manifest_path):
+            with open(manifest_path, encoding="utf-8") as f:
+                stored = json.load(f)
+            if stored.get("signature") != sig:
+                old = stored.get("params", {})
+                changed = {
+                    k: (old.get(k), params.get(k))
+                    for k in set(old) | set(params)
+                    if old.get(k) != params.get(k)
+                }
+                raise ResumeSignatureMismatch(
+                    f"resume checkpoints in {self.resume_dir} were created with "
+                    f"different settings; changed (old -> new): {changed}. "
+                    f"Remove the directory or pass a fresh --resume-dir to start over."
+                )
+            return
+        # First use: record the signature for future resumes.
+        tmp = manifest_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"signature": sig, "params": params}, f, indent=2, default=str)
+        os.replace(tmp, manifest_path)
+
     # ── Write side ─────────────────────────────────────────────────────────
     def save(
         self, block_index: int, *, input_ids, q_input, input_others, shard_state=None
@@ -237,7 +289,7 @@ class BlockCheckpointer:
             return
         removed = 0
         for fname in os.listdir(self.resume_dir):
-            if _CKPT_RE.match(fname) or fname.endswith(".pt.tmp"):
+            if _CKPT_RE.match(fname) or fname.endswith(".pt.tmp") or fname == _MANIFEST_NAME:
                 try:
                     os.remove(os.path.join(self.resume_dir, fname))
                     removed += 1

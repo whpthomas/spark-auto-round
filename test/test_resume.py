@@ -20,7 +20,12 @@ import shutil
 import pytest
 import torch
 
-from auto_round.utils.resume import BlockCheckpointer, StopAfterBlock
+from auto_round.utils.resume import (
+    BlockCheckpointer,
+    ResumeSignatureMismatch,
+    StopAfterBlock,
+    compute_signature,
+)
 
 from .helpers import get_model_path, save_tiny_model
 
@@ -145,6 +150,37 @@ class TestCheckpointerCleanup:
 
     def test_cleanup_inactive_noop(self):
         BlockCheckpointer(resume_dir=None).cleanup()  # must not raise
+
+
+class TestResumeSignature:
+    def test_signature_stable_and_param_sensitive(self):
+        a = {"iters": 1000, "group_size": 128, "seed": 42}
+        assert compute_signature(a) == compute_signature(dict(a))  # order-independent
+        assert compute_signature(a) != compute_signature({**a, "iters": 200})
+
+    def test_init_then_matching_verify_ok(self, tmp_path):
+        ckpt = BlockCheckpointer(resume_dir=str(tmp_path / "rd"))
+        params = {"iters": 1000, "group_size": 128}
+        ckpt.verify_or_init_signature(params)  # writes manifest
+        # A fresh checkpointer (simulating a new process) with same params is OK.
+        BlockCheckpointer(resume_dir=str(tmp_path / "rd")).verify_or_init_signature(dict(params))
+
+    def test_mismatch_raises(self, tmp_path):
+        ckpt = BlockCheckpointer(resume_dir=str(tmp_path / "rd"))
+        ckpt.verify_or_init_signature({"iters": 1000, "group_size": 128})
+        with pytest.raises(ResumeSignatureMismatch) as exc:
+            BlockCheckpointer(resume_dir=str(tmp_path / "rd")).verify_or_init_signature(
+                {"iters": 200, "group_size": 128}
+            )
+        # Error names the changed key.
+        assert "iters" in str(exc.value)
+
+    def test_cleanup_removes_manifest(self, tmp_path):
+        ckpt = BlockCheckpointer(resume_dir=str(tmp_path / "rd"))
+        ckpt.verify_or_init_signature({"iters": 1000})
+        ckpt.save(0, input_ids=[torch.zeros(1)], q_input=None, input_others={})
+        ckpt.cleanup()
+        assert not os.path.isdir(str(tmp_path / "rd"))  # manifest + ckpt gone, dir removed
 
 
 # ── Tier-1 seam test ───────────────────────────────────────────────────────

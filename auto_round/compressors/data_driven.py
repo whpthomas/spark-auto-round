@@ -470,6 +470,10 @@ class DataDrivenCompressor(BaseCompressor):
             )
             checkpointer.active = False
         if checkpointer.active:
+            # Refuse to resume across changed tuning settings (model collisions
+            # are already handled by the namespaced dir; this guards the same
+            # model re-run with different params).
+            checkpointer.verify_or_init_signature(self._resume_signature_params(block_names))
             completed = checkpointer.latest_completed_index()
             if completed is not None:
                 if completed >= len(block_names) - 1:
@@ -694,6 +698,31 @@ class DataDrivenCompressor(BaseCompressor):
         del inputs
 
         clear_memory(device_list=self.compress_context.device_list)
+
+    def _resume_signature_params(self, block_names: list) -> dict:
+        """Parameters that define a resumable run's output, for the signature
+        guard.  Two runs with the same values are safe to resume across; any
+        difference must abort rather than splice incompatible blocks."""
+        q = self.quantizer
+        cc = self.compress_context
+        dataset = getattr(self, "dataset", None)
+        return {
+            "num_blocks": len(block_names),
+            "bits": getattr(q, "bits", None),
+            "group_size": getattr(cc, "group_size", None),
+            "data_type": getattr(q, "data_type", None),
+            "sym": getattr(q, "sym", None),
+            "iters": getattr(q, "iters", None),
+            "seqlen": getattr(self, "seqlen", None) or getattr(q, "seqlen", None),
+            "nsamples": getattr(self, "nsamples", None) or getattr(q, "nsamples", None),
+            "batch_size": getattr(q, "batch_size", None),
+            "seed": getattr(self, "seed", None),
+            "enable_adam": getattr(q, "enable_adam", None),
+            "gradient_accumulate_steps": getattr(q, "gradient_accumulate_steps", None),
+            # Only hash the dataset when it's a named string; custom dataloaders
+            # aren't stably serializable and are the caller's responsibility.
+            "dataset": dataset if isinstance(dataset, str) else None,
+        }
 
     def _collect_cli_args(self) -> dict[str, str | int | float]:
         """Collect CLI-relevant arguments for the report header."""
