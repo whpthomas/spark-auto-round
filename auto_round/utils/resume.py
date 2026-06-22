@@ -208,13 +208,22 @@ class BlockCheckpointer:
 
     # ── Write side ─────────────────────────────────────────────────────────
     def save(
-        self, block_index: int, *, input_ids, q_input, input_others, shard_state=None
+        self,
+        block_index: int,
+        *,
+        input_ids,
+        q_input,
+        input_others,
+        shard_state=None,
+        report_layers=None,
     ) -> None:
         """Persist the activations entering block ``block_index + 1``.
 
         ``shard_state`` is the optional ShardWriter snapshot (from
         ``ShardWriter.export_state()``) needed to reassemble the final model on
-        resume when immediate-saving is active.
+        resume when immediate-saving is active. ``report_layers`` is the
+        sensitivity-report rows accumulated so far, so a resumed run's report
+        still includes the blocks tuned before the interrupt.
         """
         if not self.active:
             return
@@ -225,6 +234,7 @@ class BlockCheckpointer:
             "input_others": _to_cpu(input_others),
             "rng_state": _capture_rng_state(),
             "shard_state": shard_state,
+            "report_layers": report_layers,
         }
         # Write to a temp file then rename so a kill mid-write never leaves a
         # half-written checkpoint that resume would later trust.

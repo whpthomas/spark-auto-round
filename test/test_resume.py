@@ -356,6 +356,26 @@ def test_resume_assembles_identical_model(tiny_model_path, tmp_path):
         assert a.shape == b.shape, f"{key}: shape {a.shape} vs {b.shape}"
         assert torch.equal(a, b), f"{key}: weights diverged between reference and resumed run"
 
+    # The resumed run's report must list every block, including those tuned
+    # before the interrupt (restored from the checkpoint), not just the
+    # post-resume ones.
+    def _report_block_lines(folder):
+        import glob
+
+        txts = glob.glob(os.path.join(folder, "*report*.txt"))
+        if not txts:
+            return None
+        with open(txts[0], encoding="utf-8") as f:
+            return [ln for ln in f if "layers." in ln]
+
+    ref_lines = _report_block_lines(ref_folder)
+    res_lines = _report_block_lines(res_folder)
+    if ref_lines is not None and res_lines is not None:
+        assert len(res_lines) == len(ref_lines), (
+            f"resumed report has {len(res_lines)} block rows, "
+            f"reference has {len(ref_lines)} — pre-interrupt blocks missing"
+        )
+
 
 def test_resume_disabled_in_whole_model_mode(tiny_model_path, tmp_path):
     """When the model fits in memory (no immediate-saving), resume must disable

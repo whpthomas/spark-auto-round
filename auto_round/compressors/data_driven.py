@@ -513,6 +513,12 @@ class DataDrivenCompressor(BaseCompressor):
                         self.shard_writer._resume_skip_prefixes = set(
                             block_names[: completed + 1]
                         )
+                    # Restore report rows for the pre-interrupt blocks so the
+                    # final sensitivity report is complete (they are skipped
+                    # below and would otherwise be missing).
+                    report = getattr(self, "_report", None)
+                    if report is not None and payload.get("report_layers"):
+                        report.layers = list(payload["report_layers"])
                     resume_start = completed + 1
                     logger.info(
                         f"[resume] resuming from block {resume_start} "
@@ -688,12 +694,18 @@ class DataDrivenCompressor(BaseCompressor):
                 if self.compress_context.is_immediate_saving and self.shard_writer is not None:
                     self.shard_writer.flush_pending()
                     shard_state = self.shard_writer.export_state()
+                # Snapshot report rows so a resumed run's report still lists the
+                # blocks tuned before the interrupt (they are skipped on resume
+                # and would otherwise be absent).
+                report = getattr(self, "_report", None)
+                report_layers = list(report.layers) if report is not None else None
                 checkpointer.save(
                     i,
                     input_ids=input_ids,
                     q_input=q_input,
                     input_others=input_others,
                     shard_state=shard_state,
+                    report_layers=report_layers,
                 )
             if checkpointer.should_stop(i):
                 raise StopAfterBlock(i)
