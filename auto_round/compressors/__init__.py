@@ -27,6 +27,12 @@ if TYPE_CHECKING:
     )
     from auto_round.compressors.data_driven import DataDrivenCompressor
     from auto_round.compressors.entry import AutoRoundCompatible, AutoRound
+    from auto_round.compressors.memory_estimator import estimate_peak_memory_per_block
+    from auto_round.compressors.auto_tune import (
+        auto_tune,
+        format_preflight_message,
+        format_resume_message,
+    )
 
 __all__ = [
     "AutoRound",
@@ -37,6 +43,10 @@ __all__ = [
     "SARConfig",
     "TuningExtraConfig",
     "SchemeExtraConfig",
+    "estimate_peak_memory_per_block",
+    "auto_tune",
+    "format_preflight_message",
+    "format_resume_message",
 ]
 
 
@@ -70,4 +80,20 @@ def __getattr__(name):
             "TuningExtraConfig": TuningExtraConfig,
             "SchemeExtraConfig": SchemeExtraConfig,
         }[name]
+    elif name == "estimate_peak_memory_per_block":
+        from auto_round.compressors.memory_estimator import estimate_peak_memory_per_block
+
+        return estimate_peak_memory_per_block
+    elif name == "auto_tune":
+        from auto_round.compressors.auto_tune import auto_tune
+
+        return auto_tune
+    elif name == "format_preflight_message":
+        from auto_round.compressors.auto_tune import format_preflight_message
+
+        return format_preflight_message
+    elif name == "format_resume_message":
+        from auto_round.compressors.auto_tune import format_resume_message
+
+        return format_resume_message
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")

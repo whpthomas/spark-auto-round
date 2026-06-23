@@ -20,6 +20,9 @@ uv pip install -e .          # editable install
 | CUDA-specific tests only | `pytest test/test_cuda/ -v` |
 | Single test | `pytest test/test_cuda/quantization/test_asym.py::TestAutoRoundAsym::test_asym_group_size -v` |
 | Filter by keyword | `pytest -k "torch_compile" -v` |
+| Resume tests (fast, no GPU) | `pytest test/test_cuda/quantization/test_resume.py -v -m "not slow"` |
+| Resume tests (GPU integration) | `pytest test/test_cuda/quantization/test_resume.py -v -m cuda` |
+| CLI arg tests (no GPU) | `pytest test/test_cuda/quantization/test_resume.py::TestCliIntegration -v` |
 
 **No linting, typecheck, formatter, or CI workflows are configured.** There is no `Makefile`, `.github/` directory, or pre-commit hooks.
 
@@ -83,5 +86,54 @@ test/
     ├── test_offloader_modes.py
     ├── test_qwen3_5_export.py
     └── requirements.txt
+
+### Checkpoint & Resume (.cache/)
+
+| Aspect | Details |
+|--------|---------|
+| Storage | `{output_dir}/.cache/progress.json` + `block_NNNNN.pt` files |
+| Save | After each block completes quantization (inside `_quantize_blocks()` inner loop) |
+| Resume | Automatic — detected by presence of valid `.cache/progress.json` |
+| Cleanup | Removed on successful completion, preserved on crash/interrupt |
+| Force fresh | `spark-auto-round --clear-cache ...` |
+| Reliable | Atomic writes (`progress.json.tmp` → rename), no optimizer state saved |
+
+**Checkpoint lifecycle:**
+```
+quantize() start
+  ├── _check_resume_state() → (resume_mode, completed, total, names)
+  │     ├── No .cache/ → fresh start
+  │     ├── Corrupt → warning, fresh start
+  │     └── Valid → load completed blocks, skip in loop
+  ├── [For each remaining block]
+  │     ├── _quantize_blocks(block_idx=i, ...)
+  │     └── _save_checkpoint(i, name, module)
+  │           ├── block_{i:05d}.pt  (state dict, CPU tensors)
+  │           └── progress.json     (atomic write)
+  └── [On success]
+        └── _clear_cache() → remove .cache/
+```
+
+**Key methods** (on `DataDrivenCompressor`):
+- `_checkpoint_dir` — property returning `.cache/` path
+- `_check_resume_state()` — returns `(bool, int, int, list)`
+- `_save_checkpoint(block_idx, block_name, module)` — save state dict + progress
+- `_save_checkpoint_progress(completed)` — atomic progress.json write
+- `_load_checkpoint_block(block_idx, block_name, model)` — load block from disk
+- `_checkpoint_block_path(block_idx)` — returns full path to block file
+- `_clear_cache()` — remove `.cache/` with safety check
+- `_check_and_clear_cache_flag()` — handle `--clear-cache` flag
+
+**Edge cases handled:**
+- Missing/empty `.cache/` → fresh start
+- Corrupt `progress.json` → fresh start
+- Missing block files → fresh start
+- `completed > total` → fresh start
+- KeyboardInterrupt → `.cache/` preserved for resume
+- Exception → `.cache/` preserved for resume
+- `--clear-cache` on non-existent dir → no-op
+- `--clear-cache` on symlink → removes symlink only
+- `nblocks > 1` → checkpointing disabled with warning
+- Meta device → materialize, load state dict, re-offload
 ```
 

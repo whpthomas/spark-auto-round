@@ -6,9 +6,9 @@
 ![CUDA](https://img.shields.io/badge/CUDA-required-orange)
 ![GB10](https://img.shields.io/badge/hardware-GB10-purple)
 
-> Int4 AutoRound quantization for GB10 hardware
+> int4 AutoRound quantization for GB10 hardware
 
-# NOTE
+**NOTE**
 
 This is new software under active development. I am working my way up from Qwen 0.8b -> 27B -> 35B, 122B -> Gemma etc. I will post updates with verified results on specific models here:  
 
@@ -22,9 +22,11 @@ This is new software under active development. I am working my way up from Qwen 
 
 *+ sample of layers tested only*
 
+Spark ASAQ Substitute has problems and only works dense dense models at the moment. MOE loading in INC is broken upstream.  
+
 ## What is this?
 
-**Spark Auto Round** is an optimally pre-configured Int4 AutoRound quantization command line tool that is straightforward to use -- no tweaking necessary. This is a trimmed-down version of Intel's [auto-round](https://github.com/intel/auto-round) focused on **CUDA**, `torch.compile`, and **Int4 AutoRound (W4A16)** targeting the **DGX Spark - GB10 128GiB unified memory** architecture.
+**Spark Auto Round** is an optimally pre-configured int4 AutoRound quantization command line tool that is straightforward to use -- no tweaking necessary. This is a trimmed-down version of Intel's [auto-round](https://github.com/intel/auto-round) focused on **CUDA**, `torch.compile`, and **int4 AutoRound (W4A16)** targeting the **DGX Spark - GB10 128GiB unified memory** architecture.
 
 **Spark ASAQ Substitute** is an experimental companion tool that performs Adaptive Sensitivity-Aware Quantization by taking layer-wise Cosine Similarity, Peak Signal-to-Noise Ratio and for MOE models Router Jaccard Similarity, to replace sensitive layers with FP16 layers from the original model.
 
@@ -34,19 +36,21 @@ Intel’s AutoRound works exceptionally well on the DGX Spark and its GB10 sibli
 
 ## What is AutoRound?
 
-Intel’s AutoRound is a technique used to quantize 16-bit models down to 4-bit. AutoRound uses signed gradient descent to jointly optimize weight rounding and clipping ranges. Mixture-of-Experts models are notoriously sensitive to quantization. AutoRound preserves the “distribution” of the weights rather than just the values, keeping the MoE logic intact even at 4-bit. The weights effectively halve the model size compared to FP8. Subsequently the Blackwell GPU needs less bandwidth to pull these weights from the unified pool. Once they reach the GPU, the Tensor Cores dequantizes INT4 weights into bfloat16 on-the-fly for the actual math, giving the speed of 4-bit with the precision of 16-bit calculations. Int4 AutoRound quantization allows large models to run with ample room for speculative decoding and the KV cache.
+Intel’s AutoRound is a technique used to quantize 16-bit models down to 4-bit. AutoRound uses signed gradient descent to jointly optimize weight rounding and clipping ranges. Mixture-of-Experts models are notoriously sensitive to quantization. AutoRound preserves the “distribution” of the weights rather than just the values, keeping the MoE logic intact even at 4-bit. The weights effectively halve the model size compared to FP8. Subsequently the Blackwell GPU needs less bandwidth to pull these weights from the unified pool. Once they reach the GPU, the Tensor Cores dequantizes INT4 weights into bfloat16 on-the-fly for the actual math, giving the speed of 4-bit with the precision of 16-bit calculations. int4 AutoRound quantization allows large models to run with ample room for speculative decoding and the KV cache.
 
 ## Why not NVFP4?
 
-To run comparative benchmarks and compare and contrast quantized models we need the best version of each quantization technique for reference. This is my attempt to provide the GB10 community with optimal Int4 AutoRound models.
+To run comparative benchmarks and compare and contrast quantized models we need the best version of each quantization technique for reference. This is my attempt to provide the GB10 community with optimal int4 AutoRound models.
 
 ## Features
 
 - **Simple CLI**: Easy-to-use command-line interface i.e. `spark-auto-round <model>`
 - **GB10 Optimized**: Whole-model quantization with 128GB unified memory, or automatic fallback to block-by-block loading for large models that don't fit in memory
+- **Memory-Aware Auto-Tuner**: Pre-flight peak memory estimation automatically adjusts `--batch_size`, `--seqlen`, `--nsamples`, and `--adam` when the per-block peak exceeds available GPU budget. Relaxes the least quality-damaging setting first.
+- **Stateful Resume**: If quantization is interrupted (Ctrl-C) or crashes (OOM), re-running the same command resumes from the last completed block. On OOM resume the auto-tuner tightens its budget to avoid re-crashing.
 - **torch.compile**: Always enabled for faster quantization on CUDA
 - **New Datasets** including OpenCode Instruct and updated Github Code Clean
-- **Adaptive Sensitivity-Aware Quantization:** A companion tool that replaces sensitive layers with with fp16 layers from the original model.
+- **Adaptive Sensitivity-Aware Quantization**: A companion tool that replaces sensitive layers with fp16 layers from the original model.
 
 ## Installation
 
@@ -106,23 +110,23 @@ Spark auto round repeatedly achieved a [92/100](docs/test-score.md) tool-eval-be
 
 | # | Model | Scheme | Dataset | Score | t/s | Rating | P/F | Tokens |
 |---|-------|--------|---------|-------|-----|--------|-----|--------|
-|🥇 | **qwen3.6-27b-sar-oc-mpt** | **Int4** | OpenCode Instruct | **92** | 26.4 | ★★★★★ | 59/9/1 | 284K |
-|🥈 | qwen3.6-27b-sar-oc-dflash | Int4 | OpenCode Instruct | 90 | **38.1** | ★★★★★ | 57/10/2 | 265K |
+|🥇 | **qwen3.6-27b-sar-oc-mpt** | **int4** | OpenCode Instruct | **92** | 26.4 | ★★★★★ | 59/9/1 | 284K |
+|🥈 | qwen3.6-27b-sar-oc-dflash | int4 | OpenCode Instruct | 90 | **38.1** | ★★★★★ | 57/10/2 | 265K |
 |🥉 | qwen/qwen3.6-27b-fp8 | fp8 | - | 88 | 18.1 | ★★★★ | 57/8/4 | 275K |
-| 4 | qwen3.6-27b-sar-oc | Int4 | OpenCode Instruct | 88 | 12.5 | ★★★★ | 57/8/4 | 275K |
-| 5 | qwen3.6-27b-sar-git-mtp | Int4 | Github Code Clean | 86 | 26.2 | ★★★★ | 54/10/5 | 268K |
+| 4 | qwen3.6-27b-sar-oc | int4 | OpenCode Instruct | 88 | 12.5 | ★★★★ | 57/8/4 | 275K |
+| 5 | qwen3.6-27b-sar-git-mtp | int4 | Github Code Clean | 86 | 26.2 | ★★★★ | 54/10/5 | 268K |
 | 6 | qwen/qwen3.6-27b | bf16 | - | 83 | 11.4 | ★★★★ | 53/9/7 | 243K |
 
 ## Performance with Qwen 3.6 35b a3b
 
 | # | Model | Quant | Score | Min | Max | t/s | P/F | Weakest | Runs |
 |---|-------|-------|------:|----:|----:|-----|-----|---------|-----:|
-| 🥇 | qwen3.6-35b-sar-pc | INT4-AutoRound | 92.00 | 91 | 93 | 64 | 178/25/4 | 🟡 Instruct 80.00% | 3 |
-| 🥈 | qwen3.6-35b-sar-bf16 | INT4-AutoRound | 91.67 | 91 | 93 | 65 | 176/27/4 | 🟡 Plan 77.67% | 3 |
-| 🥉 | qwen3.6-35b-sar | INT4-AutoRound | 91.00 | 90 | 92 | 65 | 176/25/6 | 🟡 Create 77.67% | 3 |
+| 🥇 | qwen3.6-35b-sar-pc | int4 | 92.00 | 91 | 93 | 64 | 178/25/4 | 🟡 Instruct 80.00% | 3 |
+| 🥈 | qwen3.6-35b-sar-bf16 | int4 | 91.67 | 91 | 93 | 65 | 176/27/4 | 🟡 Plan 77.67% | 3 |
+| 🥉 | qwen3.6-35b-sar | int4 | 91.00 | 90 | 92 | 65 | 176/25/6 | 🟡 Create 77.67% | 3 |
 |  4 | qwen/qwen3.6-35b-fp8 | FP8 | 91.00 | 91 | 91 | 49 | 171/33/3 | 🟡 Scale 75.00% | 3 |
-|  5 | qwen3.6-35b-sar-mtp | INT4-AutoRound | 90.67 | 88 | 93 | 77 | 174/28/5 | 🟡 Instruct 80.00% | 3 |
-|  6 | qwen3.6-35b-sar-dflash | INT4-AutoRound | 88.00 | 88 | 88 | 97 | 164/37/6 | 🟠 Schema 52.67% | 3 |
+|  5 | qwen3.6-35b-sar-mtp | int4 | 90.67 | 88 | 93 | 77 | 174/28/5 | 🟡 Instruct 80.00% | 3 |
+|  6 | qwen3.6-35b-sar-dflash | int4 | 88.00 | 88 | 88 | 97 | 164/37/6 | 🟠 Schema 52.67% | 3 |
 
 ### Scripts and Recipes
 
@@ -163,7 +167,7 @@ spark-auto-round <model> [options]
 | `--nsamples` | 512 | Number of calibration samples |
 | `--seqlen` | 2048 | Calibration sequence length |
 | `--batch_size` | 8 | Calibration batch size |
-| `--output_dir` | ./models | Output directory |
+| `--output_dir` | ./models | Output directory (also stores checkpoints under `.cache/`) |
 | `--dataset` | opencode-instruct | Calibration dataset |
 | `--disable_torch_compile` | (disabled) | Disable torch.compile (enabled by default) |
 
@@ -173,6 +177,7 @@ spark-auto-round <model> [options]
 |----------|---------|-------------|
 | `--lr` | auto | Learning rate (auto-calculated if not set) |
 | `--minmax_lr` | auto | MinMax learning rate (uses --lr if not set) |
+| `--memory_safety_margin` | 0 | Extra percentage points to tighten memory_utilization (0–20). Useful if a model repeatedly OOMs despite the auto-tuner's adjustments. |
 
 ### Scheme Arguments
 
@@ -188,8 +193,67 @@ spark-auto-round <model> [options]
 |----------|---------|-------------|
 | `--model_dtype` | null | Model dtype for loading |
 | `--seed` | 42 | Random seed |
-| `--adam` | false | Use Adam optimizer |
+| `--adam` | false | Use Adam optimizer (higher quality, higher peak GPU memory) |
+| `--clear-cache` | false | Delete checkpoint cache before starting. Forces a fresh run even if a valid checkpoint exists. |
 | `--mllm` | false | Force multimodal mode |
+
+## Memory and Resume
+
+### Auto-Tuner
+
+Before quantization begins, the CLI estimates per-block peak GPU memory using your model's configuration and the current settings (`--batch_size`, `--seqlen`, `--nsamples`, `--adam`). If the estimated peak exceeds the available GPU budget (`memory_utilization` × available memory), the auto-tuner relaxes settings in priority order to bring peak below budget:
+
+| Step | Setting | Relief | Quality Impact |
+|------|---------|--------|----------------|
+| 1 | `--batch_size` 8 → 4 → 2 → 1 | 2× per step | Moderate (noisier gradients) |
+| 2 | `--seqlen` 2048 → 1024 → 512 → 256 | 2× per step | Larger (truncated context) |
+| 3 | `--nsamples` 512 → 256 → 128 | CPU RAM relief | Smaller (less coverage) |
+| 4 | `--adam` enabled → disabled | 2× wrapper params freed | Moderate (SignSGD vs Adam) |
+
+The tuner stops as soon as the budget is satisfied, preserving the highest-quality settings possible. On a fresh run you will see:
+
+```
+Memory OK: est. peak 42.1 GB / 96.0 GB (75%) — proceeding with user settings.
+```
+
+Or, if adjustments are needed:
+
+```
+Memory budget exceeded. Adjusting settings:
+  batch_size   8 → 4        (noisier gradients)
+  seqlen       2048 → 1024     (truncated context)
+Estimated peak: 58.0 GB / 96.0 GB (75%) ✓
+```
+
+### Checkpoint Resume
+
+During quantization, a checkpoint is automatically saved after each block completes:
+
+```
+{output_dir}/.cache/
+  progress.json         # Metadata: completed count, block names, exit reason
+  block_00000.pt        # Quantized state for block 0
+  block_00001.pt        # Quantized state for block 1
+  ...
+```
+
+If the run is interrupted (Ctrl-C) or crashes (CUDA OOM), the `.cache/` directory is preserved. Re-running the **same command** with the same `--output_dir` detects the checkpoint and resumes:
+
+```
+Resuming from block 9/48.
+Previous run OOM'd on block 9. Tightening settings:
+  batch_size  4 → 2  (noisier gradients)
+Estimated peak: 35.0 GB / 83.2 GB (65%) ✓
+```
+
+The exit reason (`"interrupted"` vs `"oom"`) changes the auto-tuner's behaviour on resume:
+
+| Previous Exit | Auto-Tuner Behaviour |
+|---------------|----------------------|
+| `interrupted` | Fresh auto-tune with original budget — user chose to stop, settings may be fine |
+| `oom` | Tighter budget (10pp extra margin) and skips one relaxation step — prevents re-crashing on the same settings |
+
+On successful completion, `.cache/` is automatically cleaned up. To force a fresh run despite an existing checkpoint, use `--clear-cache`.
 
 ## Datasets
 

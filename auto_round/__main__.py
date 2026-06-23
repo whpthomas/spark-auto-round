@@ -17,9 +17,16 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 
 import torch
+from transformers import AutoConfig
 
+from auto_round.compressors.auto_tune import (
+    auto_tune,
+    format_preflight_message,
+    format_resume_message,
+)
 from auto_round.schemes import PRESET_SCHEMES
 from auto_round.utils import (
     clear_memory,
@@ -97,6 +104,13 @@ class BasicArgumentParser(argparse.ArgumentParser):
             help="Run the full init pipeline except quantization tuning; "
                  "write config files only for inspection.",
         )
+        basic.add_argument(
+            "--clear-cache",
+            action="store_true",
+            default=False,
+            help="Delete checkpoint cache (.cache/) before starting quantization. "
+                 "Use this to force a fresh run if the existing checkpoint is stale or corrupt.",
+        )
 
         tuning = self.add_argument_group("Tuning Arguments")
         tuning.add_argument(
@@ -110,6 +124,14 @@ class BasicArgumentParser(argparse.ArgumentParser):
             default=None,
             type=float,
             help="MinMax learning rate (optional, uses --lr).",
+        )
+        tuning.add_argument(
+            "--memory_safety_margin",
+            type=int,
+            default=0,
+            choices=range(0, 21),
+            help="Extra percentage points to tighten memory_utilization (0-20). "
+                 "Useful if you experience repeated OOMs.",
         )
 
         scheme = self.add_argument_group("Scheme Arguments")
@@ -159,6 +181,13 @@ def tune(args):
     )
     if args.dry_run:
         logger.info("  ** DRY-RUN mode: will skip quantization, write config files only **")
+    if args.clear_cache:
+        logger.info("  --clear-cache: will delete existing checkpoint cache before starting")
+        # Optionally, verify output_dir exists for safety
+        if os.path.isdir(args.output_dir):
+            cache_path = os.path.join(args.output_dir, ".cache")
+            if os.path.isdir(cache_path):
+                logger.info("  Found existing .cache/ at %s \u2014 will be removed.", cache_path)
 
     # --- Hardcoded values for GB10 ---
     device_map = "cuda:0"
@@ -195,6 +224,128 @@ def tune(args):
     # If model exceeds memory threshold, load on meta device (zero memory)
     # and load blocks on demand during quantization.
     use_meta_device = use_offload
+
+    # -------------------------------------------------------------------
+    # Auto-tune: adjust per-block settings if peak memory exceeds budget
+    # -------------------------------------------------------------------
+    # Load model config for the estimator (no full model load needed)
+    try:
+        model_config = AutoConfig.from_pretrained(
+            model_name, trust_remote_code=args.trust_remote_code
+        )
+    except Exception as exc:
+        logger.warning("Could not load model config for auto-tuner: %s", exc)
+        model_config = None
+
+    if model_config is not None:
+        available_memory = torch.cuda.mem_get_info(0)[0]  # free + used
+        effective_utilization = memory_utilization - args.memory_safety_margin / 100.0
+        effective_utilization = max(0.50, min(0.95, effective_utilization))  # clamp [0.50, 0.95]
+
+        # Build user_settings dict for the auto-tuner
+        user_settings = {
+            "batch_size": args.batch_size,
+            "seqlen": args.seqlen,
+            "nsamples": args.nsamples,
+            "adam": args.adam,
+            "iters": args.iters,
+            "group_size": args.group_size,
+        }
+
+        # Check for resume context from checkpoint
+        resume_context = None
+        resume_mode = False
+        completed = 0
+        cache_dir = Path(args.output_dir) / ".cache"
+        progress_path = cache_dir / "progress.json"
+        if progress_path.exists():
+            try:
+                with open(progress_path, "r") as f:
+                    progress = json.load(f)
+                stored_exit_reason = progress.get("exit_reason")
+                tuning_profile = progress.get("tuning_profile")
+                stored_block_names = progress.get("block_names", [])
+                stored_total = progress.get("total", 0)
+                stored_completed = progress.get("completed", 0)
+
+                if stored_completed > 0 and stored_completed < stored_total:
+                    resume_mode = True
+                    completed = stored_completed
+                    resume_context = {
+                        "exit_reason": stored_exit_reason,
+                        "oom_count": tuning_profile.get("oom_count", 0) if tuning_profile else 0,
+                        "tuning_profile": tuning_profile,
+                    }
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Run auto-tuner
+        adjusted_settings, tune_steps = auto_tune(
+            user_settings=user_settings,
+            model_config=model_config,
+            available_memory=available_memory,
+            memory_utilization=effective_utilization,
+            resume_context=resume_context,
+        )
+
+        # Compute peak for display
+        from auto_round.compressors.memory_estimator import estimate_peak_memory_per_block
+        peak_gb, _ = estimate_peak_memory_per_block(
+            model_config, adjusted_settings,
+        )
+        budget_gb = available_memory * effective_utilization / (1024 ** 3)
+
+        # Display message
+        if resume_mode:
+            oom_count = resume_context.get("oom_count", 0) if resume_context else 0
+            msg = format_resume_message(
+                completed=completed,
+                total=stored_total if stored_total else 0,
+                exit_reason=resume_context["exit_reason"],
+                adjusted_settings=adjusted_settings,
+                steps=tune_steps,
+                peak_gb=peak_gb,
+                budget_gb=budget_gb,
+                memory_utilization=effective_utilization,
+                oom_count=oom_count,
+            )
+        else:
+            msg = format_preflight_message(
+                user_settings=user_settings,
+                adjusted_settings=adjusted_settings,
+                steps=tune_steps,
+                peak_gb=peak_gb,
+                budget_gb=budget_gb,
+                memory_utilization=effective_utilization,
+            )
+        logger.info(msg)
+
+        # Override args with adjusted settings
+        args.batch_size = adjusted_settings.get("batch_size", args.batch_size)
+        args.seqlen = adjusted_settings.get("seqlen", args.seqlen)
+        args.nsamples = adjusted_settings.get("nsamples", args.nsamples)
+        args.adam = adjusted_settings.get("adam", args.adam)
+
+        # Build tuning_profile for checkpoint metadata (Phase 3)
+        tuning_profile = {
+            "relaxation_step": len([s for s in tune_steps if not s.get("skipped")]),
+            "oom_count": (resume_context.get("oom_count", 0) + 1)
+                         if resume_context and resume_context.get("exit_reason") == "oom"
+                         else 0,
+            "settings_active": {
+                "batch_size": args.batch_size,
+                "seqlen": args.seqlen,
+                "nsamples": args.nsamples,
+                "adam": args.adam,
+            },
+        }
+    else:
+        # If model_config could not be loaded, use unmodified settings
+        adjusted_settings = {}
+        tune_steps = []
+        peak_gb = 0.0
+        budget_gb = 0.0
+        tuning_profile = None
 
     from auto_round import AutoRound
 
@@ -237,7 +388,7 @@ def tune(args):
         static_attention_dtype=None,
     )
 
-    # AutoRound with hardcoded values
+    # AutoRound with hardcoded values (and potentially adjusted settings)
     autoround = AutoRound(
         model=model_name,
         platform=platform,
@@ -262,10 +413,17 @@ def tune(args):
         momentum=0,
         trust_remote_code=args.trust_remote_code,
         dry_run=args.dry_run,
+        clear_cache=args.clear_cache,
         rotation_config=None,
         algorithm=None,
         use_meta_device=use_meta_device,
     )
+
+    # Pass tuning_profile to the compressor for checkpoint metadata
+    if hasattr(autoround, '_tuning_profile') and tuning_profile is not None:
+        autoround._tuning_profile = tuning_profile
+    if hasattr(autoround, '_exit_reason'):
+        autoround._exit_reason = None  # fresh start
 
     # Quantize and save
     model, folders = autoround.quantize_and_save(args.output_dir, format=format)

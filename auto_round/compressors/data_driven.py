@@ -13,6 +13,9 @@
 # limitations under the License.
 import copy
 import gc
+import json
+import os
+import shutil
 import time
 import traceback
 from functools import partial
@@ -91,6 +94,10 @@ class DataDrivenCompressor(BaseCompressor):
         **kwargs,
     ):
         self.iters = iters
+        self.clear_cache = kwargs.pop("clear_cache", False)
+        self._checkpoint_block_idx = 0
+        self._exit_reason: Optional[str] = None
+        self._tuning_profile: Optional[dict] = kwargs.pop("tuning_profile", None)
         super().__init__(
             config=config,
             model=model,
@@ -438,6 +445,14 @@ class DataDrivenCompressor(BaseCompressor):
         Returns:
         None
         """
+        # Checkpoint support for nblocks > 1 is not implemented
+        if nblocks > 1:
+            logger.warning_once(
+                "Checkpointing with nblocks=%d is not supported. "
+                "Checkpoints will not be saved for this run.",
+                nblocks,
+            )
+
         clear_memory(device_list=self.compress_context.device_list)
         for n, m in model.named_parameters():
             m.requires_grad_(False)
@@ -596,6 +611,16 @@ class DataDrivenCompressor(BaseCompressor):
                     for name in names:
                         self._offloader(model, name, overwrite=True)
 
+            # ── Checkpoint: save quantized state after each block ──────────
+            if nblocks == 1:
+                self._save_checkpoint(self._checkpoint_block_idx, block_name_or_names, m)
+                self._checkpoint_block_idx += 1
+            else:
+                logger.debug(
+                    f"Skipping checkpoint for block_idx={self._checkpoint_block_idx}: "
+                    f"nblocks={nblocks} > 1 not supported for checkpointing"
+                )
+
             # ── Sensitivity metrics ───────────────────────────────────────────
             if q_input is not None and hasattr(self, '_display') and self._display is not None:
                 cos_sim, psnr_db = compute_block_sensitivity(reference_output, q_input)
@@ -648,6 +673,357 @@ class DataDrivenCompressor(BaseCompressor):
         if hasattr(self.compress_context, 'output_dir'):
             args['output_dir'] = self.compress_context.output_dir
         return args
+
+    # ── Checkpoint helpers ────────────────────────────────────────────────────
+
+    @property
+    def _checkpoint_dir(self) -> Optional[str]:
+        """Return the .cache checkpoint directory path, or None if output_dir is not set."""
+        if self.compress_context and self.compress_context.output_dir:
+            return os.path.join(self.compress_context.output_dir, ".cache")
+        return None
+
+    def _check_resume_state(self) -> tuple:
+        """Check for existing checkpoint and return resume state.
+
+        Validates:
+          - .cache/progress.json exists and is valid JSON
+          - completed count is within expected range (0 < completed <= total)
+          - All block_{i:05d}.pt files for i in 0..completed-1 exist
+          - The last checkpoint file loads successfully (sanity check)
+
+        Returns:
+            (resume_mode: bool, completed: int, total: int, block_names: list[list[str]],
+             exit_reason: Optional[str], tuning_profile: Optional[dict])
+        """
+        ckpt_dir = self._checkpoint_dir
+        if ckpt_dir is None:
+            return False, 0, 0, [], None, None
+        if not os.path.isdir(ckpt_dir):
+            return False, 0, 0, [], None, None
+
+        progress_path = os.path.join(ckpt_dir, "progress.json")
+        if not os.path.isfile(progress_path):
+            logger.debug("No progress.json found in %s, starting fresh", ckpt_dir)
+            return False, 0, 0, [], None, None
+
+        # Parse progress.json
+        try:
+            with open(progress_path, "r") as f:
+                progress = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Corrupt progress.json in %s (%s), starting fresh", ckpt_dir, exc)
+            return False, 0, 0, [], None, None
+
+        completed = progress.get("completed", 0)
+        total = progress.get("total", 0)
+        saved_block_names = progress.get("block_names", [])
+
+        # Parse exit_reason and tuning_profile for stateful resume
+        exit_reason = progress.get("exit_reason", None)
+        tuning_profile = progress.get("tuning_profile", None)
+
+        # Validate completed count
+        if not isinstance(completed, int) or completed <= 0:
+            logger.debug("progress.json has completed=%s, starting fresh", completed)
+            return False, 0, 0, [], None, None
+        if not isinstance(total, int) or total < completed:
+            logger.warning(
+                "progress.json has completed=%d > total=%d, starting fresh",
+                completed, total,
+            )
+            return False, 0, 0, [], None, None
+
+        # Validate that all block checkpoint files exist
+        missing_files = []
+        for i in range(completed):
+            block_path = os.path.join(ckpt_dir, f"block_{i:05d}.pt")
+            if not os.path.isfile(block_path):
+                missing_files.append(f"block_{i:05d}.pt")
+        if missing_files:
+            logger.warning(
+                "Missing checkpoint files: %s. Starting fresh.",
+                ", ".join(missing_files),
+            )
+            return False, 0, 0, [], None, None
+
+        # Try loading the last checkpoint to verify validity
+        try:
+            last_block_path = os.path.join(ckpt_dir, f"block_{completed-1:05d}.pt")
+            sample = torch.load(last_block_path, map_location="cpu", weights_only=True)
+            if not isinstance(sample, dict) or len(sample) == 0:
+                logger.warning(
+                    "Last checkpoint %s is empty or invalid, starting fresh",
+                    last_block_path,
+                )
+                return False, 0, 0, [], None, None
+            del sample
+        except Exception as exc:
+            logger.warning(
+                "Last checkpoint %s failed to load (%s), starting fresh",
+                last_block_path, exc,
+            )
+            return False, 0, 0, [], None, None
+
+        logger.info(
+            "Found valid checkpoint: %d/%d blocks completed in %s",
+            completed, total, ckpt_dir,
+        )
+        return True, completed, total, saved_block_names, exit_reason, tuning_profile
+
+    def _checkpoint_block_path(self, block_idx: int) -> str:
+        """Return the full path to a checkpoint block file.
+
+        Args:
+            block_idx: Zero-based block index.
+
+        Returns:
+            Full path to the block checkpoint file.
+
+        Raises:
+            ValueError: If checkpoint_dir is not set (output_dir not configured).
+        """
+        ckpt_dir = self._checkpoint_dir
+        if ckpt_dir is None:
+            raise ValueError(
+                "Cannot build checkpoint path: output_dir is not set. "
+                "Call quantize_and_save() with an output_dir first."
+            )
+        return os.path.join(ckpt_dir, f"block_{block_idx:05d}.pt")
+
+    def _save_checkpoint(self, block_idx: int, block_name: str, module: torch.nn.Module) -> None:
+        """Save quantized state dict for a single completed block.
+
+        Saves:
+          - block_{block_idx:05d}.pt: module state dict (all tensors moved to CPU)
+          - progress.json: updated metadata
+
+        Only saves when nblocks == 1 (the hardcoded GB10 setting).
+        """
+        ckpt_dir = self._checkpoint_dir
+        if ckpt_dir is None:
+            return
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        # Save block state dict (tensors on CPU)
+        state_dict = {
+            k: v.detach().cpu().contiguous() if isinstance(v, torch.Tensor) else v
+            for k, v in module.state_dict().items()
+            if isinstance(v, torch.Tensor)
+        }
+        block_path = self._checkpoint_block_path(block_idx)
+        torch.save(state_dict, block_path)
+        logger.debug(f"Checkpoint saved: {block_path}")
+
+        # Update progress.json
+        self._save_checkpoint_progress(block_idx)
+
+    def _save_checkpoint_progress(self, completed: int) -> None:
+        """Write or update progress.json with the number of completed blocks."""
+        ckpt_dir = self._checkpoint_dir
+        if ckpt_dir is None:
+            return
+
+        # Ensure cache directory exists (normally created by _save_checkpoint first)
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        # Build block names list from the full block list
+        # Guard: quantizer may not be available before post_init()
+        all_block_names = []
+        try:
+            if hasattr(self, "quantizer") and self.quantizer is not None:
+                if bool(self.quantizer.quant_block_list):
+                    all_block_names = self.quantizer.quant_block_list
+                else:
+                    all_block_names = get_block_names(self.model_context.model)
+        except (AttributeError, RuntimeError):
+            pass
+
+        progress = {
+            "completed": completed,
+            "total": len(all_block_names),
+            "block_names": [b[0] if isinstance(b, list) else b for b in all_block_names],
+            "exit_reason": self._exit_reason,
+            "tuning_profile": self._tuning_profile,
+        }
+        progress_path = os.path.join(ckpt_dir, "progress.json")
+        tmp_path = progress_path + ".tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(progress, f, indent=2)
+            os.replace(tmp_path, progress_path)  # atomic on POSIX
+            logger.debug(f"Checkpoint progress updated: {progress_path}")
+        except OSError as exc:
+            logger.warning("Failed to write checkpoint progress to %s: %s", progress_path, exc)
+            # Clean up temp file if rename failed
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    def _write_exit_reason(self, exit_reason: Optional[str]) -> None:
+        """Write exit_reason and tuning_profile to progress.json (atomic write).
+
+        Parameters
+        ----------
+        exit_reason : str or None
+            "completed", "oom", "interrupted", or None (preserve existing).
+        """
+        self._exit_reason = exit_reason
+        ckpt_dir = self._checkpoint_dir
+        if ckpt_dir is None:
+            return
+
+        progress_path = os.path.join(ckpt_dir, "progress.json")
+        if not os.path.isfile(progress_path):
+            return  # nothing to annotate
+
+        try:
+            with open(progress_path, "r") as f:
+                progress = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return  # corrupt or unreadable
+
+        if exit_reason is not None:
+            progress["exit_reason"] = exit_reason
+        progress["tuning_profile"] = self._tuning_profile
+
+        # Atomic write: .tmp + os.replace
+        tmp_path = progress_path + ".tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(progress, f, indent=2)
+            os.replace(tmp_path, progress_path)
+        except OSError:
+            pass  # best-effort
+
+    def _load_checkpoint_block(self, block_idx: int, block_name: str, model: torch.nn.Module) -> None:
+        """Load a checkpointed block state dict into the model.
+
+        Handles both regular and meta-device modules:
+          - Meta device: materializes the module, loads state dict, then re-offloads
+          - Regular device: directly calls _load_state_dict_into_module
+
+        Args:
+            block_idx: Zero-based block index
+            block_name: Name of the block module (e.g. "model.layers.0")
+            model: The full model (module hierarchy)
+        """
+        ckpt_dir = self._checkpoint_dir
+        if ckpt_dir is None:
+            logger.warning("Cannot load checkpoint block %d: no checkpoint directory", block_idx)
+            return
+
+        try:
+            block_path = self._checkpoint_block_path(block_idx)
+        except ValueError:
+            logger.warning("Cannot load checkpoint block %d: output_dir not set", block_idx)
+            return
+
+        if not os.path.isfile(block_path):
+            logger.warning("Checkpoint file not found: %s", block_path)
+            return
+
+        # Load state dict from disk
+        state_dict = torch.load(block_path, map_location="cpu", weights_only=True)
+
+        try:
+            # Get the module
+            from auto_round.utils.model import get_module
+            module = get_module(model, block_name)
+            if module is None:
+                logger.warning("Cannot find module %s in model, skipping checkpoint load", block_name)
+                return
+
+            # Check if module is on meta device
+            is_meta = False
+            for p in module.parameters():
+                if p.device.type == "meta":
+                    is_meta = True
+                    break
+            if not is_meta:
+                for b in module.buffers():
+                    if b.device.type == "meta":
+                        is_meta = True
+                        break
+
+            if is_meta:
+                # Materialize from meta: create real tensors, then load state dict
+                logger.debug("Materializing meta-device module %s for checkpoint load", block_name)
+
+                materialize_model_(module)
+                # Move to CPU for state dict loading
+                module = module.to("cpu")
+                # Load state dict using the offload helper
+                from auto_round.utils.offload import _load_state_dict_into_module
+
+                _load_state_dict_into_module(state_dict, module)
+
+                # Re-offload if low_cpu_mem_usage is active
+                if self.compress_context and self.compress_context.low_cpu_mem_usage and self._offloader is not None:
+                    self._offloader(model, block_name, overwrite=True)
+            else:
+                # Module is already materialized — load state dict directly on CPU
+                from auto_round.utils.offload import _load_state_dict_into_module
+
+                _load_state_dict_into_module(state_dict, module)
+
+            logger.debug("Loaded checkpoint block %d (%s) from %s", block_idx, block_name, block_path)
+        finally:
+            # Free CPU memory from loaded state dict
+            del state_dict
+            gc.collect()
+
+    def _clear_cache(self) -> None:
+        """Remove the .cache checkpoint directory if it exists.
+
+        Safety: validates the cache directory is a proper .cache
+        subdirectory of output_dir to prevent accidental deletion of
+        arbitrary paths.
+        """
+        ckpt_dir = self._checkpoint_dir
+        if ckpt_dir is None:
+            return
+
+        # Safety check: ensure ckpt_dir is actually a .cache subdirectory
+        # of output_dir (not "/" or "/.cache" or some other path)
+        output_dir = self.compress_context.output_dir
+        if not output_dir:
+            return
+        expected_parent = os.path.normpath(os.path.join(output_dir, ".cache"))
+        actual_path = os.path.normpath(ckpt_dir)
+        if actual_path != expected_parent:
+            logger.error(
+                "Safety check failed: ckpt_dir %s is not the expected .cache path %s. "
+                "Refusing to delete.",
+                actual_path, expected_parent,
+            )
+            return
+
+        if os.path.isdir(ckpt_dir):
+            shutil.rmtree(ckpt_dir, ignore_errors=True)
+            logger.info("Removed checkpoint cache: %s", ckpt_dir)
+
+    def _check_and_clear_cache_flag(self) -> None:
+        """If the clear_cache flag is set, remove existing checkpoints.
+
+        Note: shutil.rmtree follows symlinks. If .cache/ is a symlink,
+        it will delete the target directory content.
+        """
+        if getattr(self, "clear_cache", False):
+            ckpt_dir = self._checkpoint_dir
+            if ckpt_dir and os.path.isdir(ckpt_dir):
+                if os.path.islink(ckpt_dir):
+                    logger.warning(
+                        ".cache/ is a symlink to %s. Removing symlink only, "
+                        "not the target.",
+                        os.readlink(ckpt_dir),
+                    )
+                    os.unlink(ckpt_dir)  # Remove symlink without following
+                else:
+                    shutil.rmtree(ckpt_dir, ignore_errors=True)
+                    logger.info("Removed checkpoint cache: %s", ckpt_dir)
 
     def quantize(self) -> tuple[torch.nn.Module, dict[str, Any]]:
         """Quantize the model and return the quantized model along with layer configurations.The entry of AutoRound.
@@ -738,82 +1114,178 @@ class DataDrivenCompressor(BaseCompressor):
         )
         self._display.begin()
 
-        start_time = time.time()
-        for block_names in all_blocks:
-            inputs = all_inputs[block_names[0]]
-            all_inputs.pop(block_names[0])
-            q_inputs = None
-            if all_q_inputs is not None:
-                q_inputs = all_q_inputs[block_names[0]]
-                all_q_inputs.pop(block_names[0])
-
-            inputs, q_inputs = _update_inputs(inputs, q_inputs, self.model_context)
-
-            clear_memory(self.inputs, device_list=self.compress_context.device_list)
-
-            if "input_ids" in inputs.keys():
-                total_samples = len(inputs["input_ids"])
-                if total_samples < self.quantizer.batch_size:
-                    self.quantizer.batch_size = total_samples
-                    logger.warning(f"force the train batch size to {total_samples}")
-
-            self._quantize_blocks(
-                self.model_context.model,
-                inputs,
-                block_names,
-                q_input=q_inputs if q_inputs is not None else None,
-                nblocks=self.nblocks,
-                input_others_extra_blocks=all_inputs,
-            )
-            if self.compress_context.is_immediate_packing and len(self.formats) != 1:
-                raise ValueError(
-                    f"Expected exactly one packing format when 'immediate_packing' is True, "
-                    f"but got {len(self.formats)} formats."
-                )
-        # Finalize display and save report
-        peak_ram = getattr(memory_monitor, 'peak_ram', None)
-        peak_vram = None
-        if hasattr(memory_monitor, 'peak_vram') and memory_monitor.peak_vram:
-            peak_vram = max(memory_monitor.peak_vram.values())
-        self._display.end(peak_ram_gb=peak_ram, peak_vram_gb=peak_vram)
-        self._report.set_memory_summary(peak_ram_gb=peak_ram, peak_vram_gb=peak_vram)
-        if hasattr(self.compress_context, 'output_dir') and self.compress_context.output_dir:
-            report_path = self._report.save(self.compress_context.output_dir)
-            logger.info(f"Quantization report saved to {report_path}")
-        if self.compress_context.low_cpu_mem_usage:
-            self._offloader.reload(self.model_context.model)
-        self._quantize_layers(layer_names, all_inputs)
-
-        convert_module_to_hp_if_necessary(
-            self.model_context.model, self.model_context.amp_dtype, self.compress_context.device, to_cpu=True
+        # ── Reset checkpoint counter and check resume state ──────────────────
+        self._checkpoint_block_idx = 0
+        resume_mode, completed, total_saved, saved_block_names, exit_reason, tuning_profile = (
+            self._check_resume_state()
         )
-        if self.compress_context.is_immediate_saving:
-            self.shard_writer.write(is_finalize=True)
+        self._exit_reason = exit_reason
+        self._tuning_profile = tuning_profile
 
-        end_time = time.time()
-        cost_time = end_time - start_time
-        logger.info(f"quantization tuning time {cost_time}")
-
-        # Dump a summary
-        quantized_layers = []
-        unquantized_layers = []
-        for n, m in self.model_context.model.named_modules():
-            if isinstance(m, tuple(SUPPORTED_LAYER_TYPES)):
-                if check_to_quantized(m):
-                    quantized_layers.append(n)
+        # ── Resume mode: load completed blocks into model ───────────────────
+        if resume_mode and completed > 0:
+            logger.info("Loading %d completed blocks from checkpoint...", completed)
+            for i in range(completed):
+                block_name = saved_block_names[i] if i < len(saved_block_names) else None
+                if block_name is None:
+                    if i < len(all_blocks):
+                        block_entry = all_blocks[i]
+                        block_name = block_entry[0] if isinstance(block_entry, list) else block_entry
+                if block_name:
+                    self._load_checkpoint_block(i, block_name, self.model_context.model)
                 else:
-                    unquantized_layers.append(n)
-            elif hasattr(m, "scales") or hasattr(m, "scale"):  # packing_immediately
-                quantized_layers.append(n)
-        summary_info = (
-            f"Summary: quantized {len(quantized_layers)}/{len(quantized_layers) + len(unquantized_layers)} in the model"
-        )
-        if len(unquantized_layers) > 0:
-            compressed_unquantized_layers = compress_layer_names(unquantized_layers)
-            summary_info += f", unquantized layers: {compressed_unquantized_layers}"
-        logger.info(summary_info)
+                    logger.warning(
+                        "Cannot resolve block name for index %d, skipping checkpoint load", i
+                    )
+            logger.info("Completed block loading. Resuming from block %d.", completed)
+        elif not resume_mode:
+            logger.info("Fresh quantization run: no existing checkpoint found.")
 
-        self.model_context.quantized = True
+        # ── All blocks already completed? Skip quantization loop ────────────
+        all_done = resume_mode and completed >= len(all_blocks)
+        if all_done:
+            logger.info(
+                "All %d blocks already completed in checkpoint. "
+                "Skipping quantization tuning.",
+                completed,
+            )
+
+        start_time = time.time()
+        try:
+            for block_names in all_blocks:
+                if all_done:
+                    break
+                # In resume mode, skip blocks up to completed count
+                if resume_mode and self._checkpoint_block_idx < completed:
+                    logger.info(f"Skipping already-completed block {self._checkpoint_block_idx}: {block_names}")
+                    inputs = all_inputs[block_names[0]]
+                    all_inputs.pop(block_names[0])
+                    if all_q_inputs is not None:
+                        all_q_inputs.pop(block_names[0], None)
+                    self._checkpoint_block_idx += len(block_names)
+                    continue
+
+                inputs = all_inputs[block_names[0]]
+                all_inputs.pop(block_names[0])
+                q_inputs = None
+                if all_q_inputs is not None:
+                    q_inputs = all_q_inputs[block_names[0]]
+                    all_q_inputs.pop(block_names[0])
+
+                inputs, q_inputs = _update_inputs(inputs, q_inputs, self.model_context)
+
+                clear_memory(self.inputs, device_list=self.compress_context.device_list)
+
+                if "input_ids" in inputs.keys():
+                    total_samples = len(inputs["input_ids"])
+                    if total_samples < self.quantizer.batch_size:
+                        self.quantizer.batch_size = total_samples
+                        logger.warning(f"force the train batch size to {total_samples}")
+
+                self._quantize_blocks(
+                    self.model_context.model,
+                    inputs,
+                    block_names,
+                    q_input=q_inputs if q_inputs is not None else None,
+                    nblocks=self.nblocks,
+                    input_others_extra_blocks=all_inputs,
+                )
+                if self.compress_context.is_immediate_packing and len(self.formats) != 1:
+                    raise ValueError(
+                        f"Expected exactly one packing format when 'immediate_packing' is True, "
+                        f"but got {len(self.formats)} formats."
+                    )
+
+            # ── Post-loop: finalize display, save report, extra layers ────
+            peak_ram = getattr(memory_monitor, 'peak_ram', None)
+            peak_vram = None
+            if hasattr(memory_monitor, 'peak_vram') and memory_monitor.peak_vram:
+                peak_vram = max(memory_monitor.peak_vram.values())
+            self._display.end(peak_ram_gb=peak_ram, peak_vram_gb=peak_vram)
+            self._report.set_memory_summary(peak_ram_gb=peak_ram, peak_vram_gb=peak_vram)
+            if hasattr(self.compress_context, 'output_dir') and self.compress_context.output_dir:
+                report_path = self._report.save(self.compress_context.output_dir)
+                logger.info(f"Quantization report saved to {report_path}")
+            if self.compress_context.low_cpu_mem_usage:
+                self._offloader.reload(self.model_context.model)
+            self._quantize_layers(layer_names, all_inputs)
+
+            convert_module_to_hp_if_necessary(
+                self.model_context.model, self.model_context.amp_dtype, self.compress_context.device, to_cpu=True
+            )
+            if self.compress_context.is_immediate_saving:
+                self.shard_writer.write(is_finalize=True)
+
+            end_time = time.time()
+            cost_time = end_time - start_time
+            logger.info(f"quantization tuning time {cost_time}")
+
+            # Dump a summary
+            quantized_layers = []
+            unquantized_layers = []
+            for n, m in self.model_context.model.named_modules():
+                if isinstance(m, tuple(SUPPORTED_LAYER_TYPES)):
+                    if check_to_quantized(m):
+                        quantized_layers.append(n)
+                    else:
+                        unquantized_layers.append(n)
+                elif hasattr(m, "scales") or hasattr(m, "scale"):  # packing_immediately
+                    quantized_layers.append(n)
+            summary_info = (
+                f"Summary: quantized {len(quantized_layers)}/{len(quantized_layers) + len(unquantized_layers)} in the model"
+            )
+            if len(unquantized_layers) > 0:
+                compressed_unquantized_layers = compress_layer_names(unquantized_layers)
+                summary_info += f", unquantized layers: {compressed_unquantized_layers}"
+            logger.info(summary_info)
+
+            self.model_context.quantized = True
+
+        except KeyboardInterrupt:
+            logger.warning(
+                "Quantization interrupted by user. Checkpoint files are preserved in .cache/."
+            )
+            logger.warning(
+                "  To resume, re-run with the same --output_dir. "
+                "To start fresh, add --clear-cache."
+            )
+            self._write_exit_reason("interrupted")
+            raise
+
+        except torch.OutOfMemoryError as e:
+            logger.error(f"Out of memory during quantization: {e}")
+            self._write_exit_reason("oom")
+            raise
+
+        except BaseException as exc:
+            # Check for OOM wrapped in RuntimeError (sometimes CUDA OOM wraps as RuntimeError)
+            err_str = str(exc).lower()
+            oom_patterns = ["out of memory", "cuda out of memory", "cuda oom", "cuda error"]
+            if any(p in err_str for p in oom_patterns):
+                logger.error(f"CUDA OOM detected in error: {exc}")
+                self._write_exit_reason("oom")
+            else:
+                logger.warning(
+                    "Quantization failed with %s: %s. Checkpoint files are preserved in .cache/.",
+                    type(exc).__name__, exc,
+                )
+                logger.warning(
+                    "  To resume, fix the issue and re-run with the same --output_dir. "
+                    "To start fresh, add --clear-cache."
+                )
+                # Don't overwrite a more specific exit_reason that may be on disk
+                if self._exit_reason is None:
+                    self._write_exit_reason(None)
+            raise
+
+        else:
+            # Success: write exit_reason before clearing cache
+            self._write_exit_reason("completed")
+            # No exception: clean up .cache/ on successful completion
+            if self.compress_context.output_dir:
+                self._clear_cache()
+                logger.info("Checkpoint cache cleaned up after successful quantization.")
+
         return self.model_context.model, self.quantizer.layer_config
 
     def _quantize_layers(self, layer_names: list, layer_inputs: dict) -> None:

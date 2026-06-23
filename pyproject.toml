@@ -48,4 +48,6 @@ version = {attr = "auto_round.version.__version__"}
 [tool.pytest.ini_options]
 markers = [
     "skip_ci: mark test as skipped in CI (not necessary since covered by backend tests)",
+    "cuda: test requires CUDA-capable GPU",
+    "slow: test takes longer than 30 seconds",
 ]
