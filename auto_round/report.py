@@ -61,7 +61,7 @@ class QuantizationReport:
 
         report = QuantizationReport(
             model_name="Qwen/Qwen3.5-0.8B",
-            version="0.14.2",
+            version="0.14.3",
             cli_args={"batch_size": 8, "iters": 1000},
         )
         # After each block:
@@ -83,6 +83,7 @@ class QuantizationReport:
         self.layers: list[LayerResult] = []
         self.peak_ram_gb: float | None = None
         self.peak_vram_gb: float | None = None
+        self.auto_tuner_steps: list | None = None
 
     def add_layer(
         self,
@@ -188,6 +189,32 @@ class QuantizationReport:
         passed = sum(1 for l in self.layers if l.passed)
         return {"total": total, "passed": passed, "warn": total - passed}
 
+    def get_quality_summary(self) -> dict:
+        """Return aggregate quality metrics across all blocks.
+
+        Returns:
+            Dict with keys:
+                avg_cosine_sim: Average cosine similarity (0-1).
+                avg_psnr_db: Average PSNR in dB.
+                min_cosine_sim: Minimum cosine similarity across blocks.
+                min_psnr_db: Minimum PSNR across blocks.
+                total: Total blocks quantized.
+                passed: Blocks above both thresholds.
+                warn: Blocks below at least one threshold.
+        """
+        cos_sims = [l.cosine_sim for l in self.layers if l.cosine_sim != float("inf")]
+        psnrs = [l.psnr_db for l in self.layers if l.psnr_db != float("inf")]
+
+        summary = self.get_summary()
+
+        return {
+            "avg_cosine_sim": sum(cos_sims) / len(cos_sims) if cos_sims else 1.0,
+            "avg_psnr_db": sum(psnrs) / len(psnrs) if psnrs else float("inf"),
+            "min_cosine_sim": min(cos_sims) if cos_sims else 1.0,
+            "min_psnr_db": min(psnrs) if psnrs else float("inf"),
+            **summary,
+        }
+
     # ── Internal ────────────────────────────────────────────────────────
 
     def _status_icon(self, passed: bool) -> str:
@@ -220,6 +247,9 @@ class QuantizationReport:
             for key, value in self.cli_args.items():
                 lines.append(f"  --{key} {value}")
         lines.append("")
+
+        # Auto-Tuner Adjustments section (if any)
+        lines.extend(self._format_auto_tuner_section())
 
         # Memory Summary section
         lines.append("Memory Summary:")
@@ -277,4 +307,27 @@ class QuantizationReport:
             f"PSNR < {PSNR_THRESHOLD} dB"
         )
 
+        return lines
+
+    def _format_auto_tuner_section(self) -> list[str]:
+        """Format the auto-tuner adjustments section for the report.
+
+        Returns:
+            List of lines for the auto-tuner section, or empty list if no adjustments.
+        """
+        if not self.auto_tuner_steps:
+            return []
+
+        active_steps = [s for s in self.auto_tuner_steps if not s.get("skipped")]
+        if not active_steps:
+            return []
+
+        lines = ["Auto-Tuner Adjustments:"]
+        for step in active_steps:
+            setting = step.get("setting", "")
+            old_val = step.get("old", "")
+            new_val = step.get("new", "")
+            impact = step.get("impact", "")
+            lines.append(f"  {setting:<12} {old_val} → {new_val}  ({impact})")
+        lines.append("")
         return lines

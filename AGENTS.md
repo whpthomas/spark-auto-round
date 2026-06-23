@@ -23,6 +23,8 @@ uv pip install -e .          # editable install
 | Resume tests (fast, no GPU) | `pytest test/test_cuda/quantization/test_resume.py -v -m "not slow"` |
 | Resume tests (GPU integration) | `pytest test/test_cuda/quantization/test_resume.py -v -m cuda` |
 | CLI arg tests (no GPU) | `pytest test/test_cuda/quantization/test_resume.py::TestCliIntegration -v` |
+| Auto-tuner tests (no GPU) | `pytest test/test_cuda/test_auto_tune.py -v -m "not slow"` |
+| Memory estimator tests (no GPU) | `pytest test/test_cuda/test_memory_estimator.py -v -m "not slow"` |
 
 **No linting, typecheck, formatter, or CI workflows are configured.** There is no `Makefile`, `.github/` directory, or pre-commit hooks.
 
@@ -32,33 +34,50 @@ uv pip install -e .          # editable install
 auto_round/              # Main package (installed as `spark_auto_round`)
 ├── __main__.py          # CLI: spark-auto-round entrypoint → start() → tune()
 ├── __init__.py          # Exports AutoRound; calls monkey_patch() on import
-├── autoround.py         # AutoRound facade — delegates to AutoRoundCompatible via __new__
+├── autoround.py         # AutoRound() factory function → delegates to auto_round_factory()
 ├── schemes.py           # QuantizationScheme dataclass + W4A16 preset
 ├── formats.py           # OutputFormat (auto_round, fake)
-├── compressors/         # Core: entry.py (factory), data_driven.py, config.py (SARConfig)
-├── algorithms/          # sign_round (SignSGD)
-├── data_type/           # INT/FP quantization kernels
-├── export/              # Export to auto_round format (export_to_autoround/)
-├── calibration/         # LLM calibration data loading
-├── modeling/            # Multimodal/MoE layer handling
-├── special_model_handler.py  # Model-specific logic (Gemma 4, Qwen, DeepSeek, etc.)
 ├── envs.py              # Env vars (AR_LOG_LEVEL, AR_DYNAMO_CACHE_SIZE_LIMIT, etc.)
-├── wrapper.py           # WrapperLinear for tuning
-├── cli_display.py       # CLI progress bar and sensitivity lines
+├── wrapper.py           # WrapperLinear, WrapperMultiblock for tuning
+├── cli_display.py       # CLIDisplay: progress bar, sensitivity lines, auto-tune messages
 ├── metrics.py           # Quantization metrics (PSNR, cosine similarity)
 ├── report.py            # QuantizationReport (per-layer pass/warn/fail)
 ├── logger.py            # Logging setup
+├── calib_dataset.py     # Dataset loading and preprocessing
+├── special_model_handler.py  # Model-specific logic (Gemma 4, Qwen, DeepSeek, etc.)
+├── version.py           # __version__ (dynamic from setuptools)
+├── compressors/         # Core quantization engine
+│   ├── entry.py         # auto_round_factory() + AutoRoundCompatible() (backward compat)
+│   ├── data_driven.py   # DataDrivenCompressor — main quantization loop + checkpointing
+│   ├── base.py          # BaseCompressor abstract class
+│   ├── config.py        # SARConfig (SAR-specific configuration)
+│   ├── auto_tune.py     # Memory-aware auto-tuner (relaxation ladder)
+│   ├── memory_estimator.py  # Per-block peak memory estimation
+│   ├── shard_writer.py  # Model shard writer for export
+│   ├── utils.py         # Compressor utility functions
+│   ├── mllm_mixin.py    # Multimodal model mixin for DataDrivenCompressor
+│   └── mllm/            # Multimodal compression support
+├── algorithms/          # Quantization algorithms
+│   ├── quantization/    # sign_round (SignSGD), sign_roundv2
+│   └── transforms/      # Rotation transforms, normalization
+├── data_type/           # INT/FP quantization kernels (int.py, w4fp8.py)
+├── export/              # Export to auto_round format (export_to_autoround/)
+├── calibration/         # LLM/MLLM calibration data loading (dataset.py, processor.py)
+├── context/             # Compression context (model.py, compress.py, base.py)
+├── modeling/            # Multimodal/MoE layer handling (fused_moe/, unfused_moe/)
 ├── asqa/                # ASAQ layer substitution utility
-│   ├── __init__.py      # Package exports
 │   ├── __main__.py      # CLI: spark-asqa-substitute entrypoint
 │   ├── router_jaccard.py  # Router Jaccard Similarity for MOE models
 │   └── substitute.py    # Core substitution engine
 └── utils/               # Device detection, model loading, monkey patches
+    ├── device/          # Device detection, memory estimation, patches
+    ├── model/           # Model loading, detection, slicing
+    └── common.py        # monkey_patch_transformers(), monkey_patch()
 
 auto_round_extension/    # Low-level quantization kernels
-├── cuda/                # Marlin/GPTQ kernels
-├── triton/              # Triton quantized linear layers
-└── torch/               # Pure-torch quantized linear layers
+├── cuda/                # Marlin/GPTQ kernels (gptqmodel_marlin.py)
+├── triton/              # Triton quantized linear layers (qlinear_tritonv2.py)
+└── torch/               # Pure-torch quantized linear layers (qlinear_torch.py)
 
 test/
 ├── conftest.py          # Test configuration (adds parent to sys.path)
@@ -71,17 +90,22 @@ test/
 ├── test_metrics.py      # Quantization metrics tests (no GPU)
 ├── test_report.py       # QuantizationReport tests (no GPU)
 ├── test_shard_writer.py # Shard writer tests (no GPU)
+├── test_qwen3_5_regression.py  # Qwen 3.5 regression tests
 ├── test_asqa/           # ASAQ unit tests (no GPU)
 │   ├── test_router_jaccard.py
 │   └── test_substitute.py
 ├── test_utils/          # Utility tests (no GPU)
 │   └── test_revert_checkpoint.py
 └── test_cuda/           # CUDA tests (needs GPU)
-    ├── quantization/    # test_asym.py, test_packing.py, test_torch_compile.py
+    ├── quantization/    # test_asym.py, test_packing.py, test_torch_compile.py, test_resume.py
     ├── algorithms/      # (empty, reserved)
-    ├── test_asqa_integration.py
-    ├── test_dry_run.py
+    ├── test_auto_tune.py  # Auto-tuner tests
+    ├── test_memory_estimator.py  # Memory estimator tests
     ├── test_memory_strategy.py
+    ├── test_cli_integration_full.py  # Full CLI integration tests
+    ├── test_asqa_integration.py
+    ├── test_asqa_e2e.py
+    ├── test_dry_run.py
     ├── test_meta_device.py
     ├── test_offloader_modes.py
     ├── test_qwen3_5_export.py

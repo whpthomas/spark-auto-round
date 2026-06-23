@@ -184,12 +184,16 @@ class CLIDisplay:
         self,
         peak_ram_gb: float | None = None,
         peak_vram_gb: float | None = None,
+        quality_summary: dict | None = None,
+        tune_steps: list | None = None,
     ) -> None:
         """Finalize the display.
 
         Args:
             peak_ram_gb: Peak RAM usage in GB (for logging).
             peak_vram_gb: Peak VRAM usage in GB (for logging).
+            quality_summary: Aggregate quality metrics from QuantizationReport.
+            tune_steps: Auto-tuner adjustment steps to display.
         """
         elapsed = time.time() - self._start_time if self._start_time else 0
         hours, remainder = divmod(int(elapsed), 3600)
@@ -207,6 +211,33 @@ class CLIDisplay:
             f"Quantization complete: {self._total_blocks}/{self._total_blocks} "
             f"blocks{mem_str} | {time_str}"
         )
+
+        # Print auto-tuner adjustments (if any were applied)
+        if tune_steps:
+            active_steps = [s for s in tune_steps if not s.get("skipped")]
+            if active_steps:
+                print("Auto-tuner adjustments:")
+                for s in active_steps:
+                    setting = s.get("setting", "")
+                    old_val = s.get("old", "")
+                    new_val = s.get("new", "")
+                    impact = s.get("impact", "")
+                    print(f"  {setting:<12} {old_val} → {new_val}  ({impact})")
+
+        # Print quality summary
+        if quality_summary:
+            avg_cos = quality_summary.get("avg_cosine_sim", 0)
+            avg_psnr = quality_summary.get("avg_psnr_db", 0)
+            passed = quality_summary.get("passed", 0)
+            total = quality_summary.get("total", 0)
+            warn = quality_summary.get("warn", 0)
+
+            psnr_str = f"{avg_psnr:.1f}" if avg_psnr != float("inf") else "∞"
+            print(
+                f"Quality: avg cosine {avg_cos:.4f} | "
+                f"avg PSNR {psnr_str} dB | "
+                f"{passed}/{total} passed, {warn} warnings"
+            )
 
     # ── Internal ────────────────────────────────────────────────────────
 

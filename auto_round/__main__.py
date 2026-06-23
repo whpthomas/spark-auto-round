@@ -314,6 +314,7 @@ def tune(args):
                 peak_gb=peak_gb,
                 budget_gb=budget_bytes / (1024 ** 3),
             )
+        print(msg)
         logger.info(msg)
 
         # Override args with adjusted settings
@@ -410,6 +411,7 @@ def tune(args):
         algorithm=None,
         use_meta_device=use_meta_device,
         tuning_profile=tuning_profile,
+        auto_tuner_steps=tune_steps,
     )
 
     # Reset exit_reason for fresh start (state initialization, not duck-typing)

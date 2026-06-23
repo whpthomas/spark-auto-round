@@ -92,6 +92,7 @@ class DataDrivenCompressor(BaseCompressor):
         seed: int = 42,
         low_cpu_mem_usage: bool = True,
         tuning_profile: Optional[dict] = None,
+        auto_tuner_steps: Optional[list] = None,
         **kwargs,
     ):
         self.iters = iters
@@ -99,6 +100,7 @@ class DataDrivenCompressor(BaseCompressor):
         self._checkpoint_block_idx = 0
         self._exit_reason: Optional[str] = None
         self._tuning_profile = tuning_profile
+        self._auto_tuner_steps = auto_tuner_steps
         super().__init__(
             config=config,
             model=model,
@@ -1202,8 +1204,17 @@ class DataDrivenCompressor(BaseCompressor):
             peak_vram = None
             if hasattr(memory_monitor, 'peak_vram') and memory_monitor.peak_vram:
                 peak_vram = max(memory_monitor.peak_vram.values())
-            self._display.end(peak_ram_gb=peak_ram, peak_vram_gb=peak_vram)
+            # Compute quality summary for display
+            quality_summary = self._report.get_quality_summary()
+            self._display.end(
+                peak_ram_gb=peak_ram,
+                peak_vram_gb=peak_vram,
+                quality_summary=quality_summary,
+                tune_steps=self._auto_tuner_steps,
+            )
             self._report.set_memory_summary(peak_ram_gb=peak_ram, peak_vram_gb=peak_vram)
+            # Set auto-tuner steps on report for saved report file
+            self._report.auto_tuner_steps = self._auto_tuner_steps
             if hasattr(self.compress_context, 'output_dir') and self.compress_context.output_dir:
                 report_path = self._report.save(self.compress_context.output_dir)
                 logger.info(f"Quantization report saved to {report_path}")

@@ -52,6 +52,7 @@ def AutoRound(
     enable_alg_ext: bool = False,
     disable_opt_rtn: bool | None = None,
     low_cpu_mem_usage: bool = True,
+    auto_tuner_steps: list | None = None,
     **kwargs,
 ) -> "DataDrivenCompressor":
     """Create a quantizer for W4A16 LLM quantization.
@@ -83,6 +84,9 @@ def AutoRound(
         enable_alg_ext: Enable algorithm extension.
         disable_opt_rtn: Disable RTN optimization.
         low_cpu_mem_usage: Lower CPU memory mode.
+        auto_tuner_steps: Optional list of auto-tuner adjustment steps from
+            the pre-flight tuning. Used to display auto-tuner summary at
+            end-of-run. Defaults to None (no summary shown).
 
     Returns:
         DataDrivenCompressor: Configured compressor ready for quantization.
@@ -109,6 +113,7 @@ def AutoRound(
         enable_alg_ext=enable_alg_ext,
         disable_opt_rtn=disable_opt_rtn,
         low_cpu_mem_usage=low_cpu_mem_usage,
+        auto_tuner_steps=auto_tuner_steps,
         **kwargs,
     )
 
