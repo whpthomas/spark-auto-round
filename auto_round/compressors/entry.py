@@ -190,7 +190,7 @@ def auto_round_factory(
     for _k in (
         "disable_opt_rtn", "use_meta_device",
         # Legacy kwargs from old API that are no longer used
-        "enable_adam", "extra_config", "not_use_best_mse", "momentum",
+        "extra_config", "not_use_best_mse", "momentum",
         "rotation_config", "algorithm", "enable_alg_ext",
     ):
         kwargs.pop(_k, None)
@@ -232,7 +232,6 @@ def _pop_config_kwargs(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str
         "not_use_best_mse",
         "dynamic_max_gap",
         "optimizer",
-        "enable_adam",
         "momentum",
     )
     common_kwargs = {}

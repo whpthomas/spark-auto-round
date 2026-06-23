@@ -47,7 +47,7 @@ def AutoRound(
     device_map: Union[str, torch.device, int, dict] = 0,
     enable_torch_compile: bool = False,
     seed: int = 42,
-    enable_adam: bool = False,
+    # enable_adam removed — Adam optimizer not supported in this fork
     extra_config: "ExtraConfig" = None,
     enable_alg_ext: bool = False,
     disable_opt_rtn: bool | None = None,
@@ -76,7 +76,9 @@ def AutoRound(
         device_map: Device map for each module.
         enable_torch_compile: Enable torch.compile.
         seed: Random seed.
-        enable_adam: Use Adam optimizer.
+        tuning_profile: Optional dict of tuning metadata for checkpoint.
+            Contains relaxation_step, oom_count, settings_active. Set to
+            None for fresh runs; populated from progress.json on resume.
         extra_config: Extra configuration object.
         enable_alg_ext: Enable algorithm extension.
         disable_opt_rtn: Disable RTN optimization.
@@ -103,7 +105,6 @@ def AutoRound(
         device_map=device_map,
         enable_torch_compile=enable_torch_compile,
         seed=seed,
-        enable_adam=enable_adam,
         extra_config=extra_config,
         enable_alg_ext=enable_alg_ext,
         disable_opt_rtn=disable_opt_rtn,

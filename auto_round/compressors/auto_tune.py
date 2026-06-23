@@ -21,10 +21,9 @@ Usage:
     from auto_round.compressors.auto_tune import auto_tune
 
     adjusted, steps = auto_tune(
-        user_settings={"batch_size": 8, "seqlen": 2048, "nsamples": 512, "adam": True},
+        user_settings={"batch_size": 8, "seqlen": 2048, "nsamples": 512},
         model_config=config,
-        available_memory=128 * 1024**3,  # 128 GB
-        memory_utilization=0.75,
+        budget_bytes=96 * 1024**3,  # 96 GiB ceiling
     )
 """
 
@@ -58,11 +57,6 @@ _RELAXATION_LADDER: List[Dict[str, Any]] = [
         "levels": [512, 256, 128],
         "impact": "less calibration coverage",
     },
-    {
-        "key": "adam",
-        "levels": [True, False],  # enabled → disabled
-        "impact": "SignSGD vs Adam optimizer",
-    },
 ]
 
 # Settings that the auto-tuner must never touch
@@ -77,8 +71,7 @@ _NEVER_AUTO_TUNE = {"iters", "group_size"}
 def auto_tune(
     user_settings: Dict[str, Any],
     model_config: "AutoConfig",  # noqa: F821
-    available_memory: int,
-    memory_utilization: float = 0.75,
+    budget_bytes: int,
     resume_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Adjust user settings to fit within available memory budget.
@@ -86,14 +79,13 @@ def auto_tune(
     Parameters
     ----------
     user_settings : dict
-        Must contain: batch_size, seqlen, nsamples, adam (bool).
+        Must contain: batch_size, seqlen, nsamples.
         May contain: group_size, iters (ignored by tuner).
     model_config : AutoConfig
         HuggingFace model config (for extracting hidden dimensions).
-    available_memory : int
-        GPU memory available in bytes (from torch.cuda.mem_get_info()).
-    memory_utilization : float
-        Fraction of available_memory to use as budget (default 0.75).
+    budget_bytes : int
+        Hard memory ceiling in bytes for estimated peak per block.
+        Typically: min(args.memory_budget, 120) * 1024^3.
     resume_context : dict or None
         From checkpoint progress.json, if resuming:
             exit_reason : str | None     ("oom", "interrupted", None)
@@ -112,9 +104,6 @@ def auto_tune(
 
     # -- Determine starting position in the relaxation ladder ----------------
     _, skip_count = _resolve_resume_offset(resume_context)
-
-    # -- Compute budget ------------------------------------------------------
-    budget_bytes = int(available_memory * memory_utilization)
 
     # -- Copy the ladder to avoid mutating the module-level list -------------
     ladder: List[Dict[str, Any]] = copy.deepcopy(_RELAXATION_LADDER)
@@ -215,7 +204,6 @@ def format_preflight_message(
     steps: List[Dict[str, Any]],
     peak_gb: float,
     budget_gb: float,
-    memory_utilization: float,
 ) -> str:
     """Return a plain-text string for the pre-flight log message.
 
@@ -225,12 +213,12 @@ def format_preflight_message(
         if peak_gb <= budget_gb:
             return (
                 f"Memory OK: est. peak {peak_gb:.1f} GB / {budget_gb:.1f} GB "
-                f"({memory_utilization*100:.0f}%) — proceeding with user settings."
+                f"— proceeding with user settings."
             )
         else:
             return (
                 f"Memory budget exceeded (peak {peak_gb:.1f} GB / budget "
-                f"{budget_gb:.1f} GB, {memory_utilization*100:.0f}%). "
+                f"{budget_gb:.1f} GB). "
                 f"No further relaxations available — ⚠️ still exceeds budget."
             )
 
@@ -246,7 +234,6 @@ def format_preflight_message(
         )
     lines.append(
         f"Estimated peak: {peak_gb:.1f} GB / {budget_gb:.1f} GB "
-        f"({memory_utilization*100:.0f}%) "
         + ("✓" if peak_gb <= budget_gb else "⚠️ still exceeds budget")
     )
     return "\n".join(lines)
@@ -260,7 +247,6 @@ def format_resume_message(
     steps: List[Dict[str, Any]],
     peak_gb: float,
     budget_gb: float,
-    memory_utilization: float,
     oom_count: int = 0,
 ) -> str:
     """Return a plain-text string for resume log message."""
@@ -285,8 +271,7 @@ def format_resume_message(
             )
 
     lines.append(
-        f"Estimated peak: {peak_gb:.1f} GB / {budget_gb:.1f} GB "
-        f"({memory_utilization*100:.0f}%)"
+        f"Estimated peak: {peak_gb:.1f} GB / {budget_gb:.1f} GB"
     )
     return "\n".join(lines)
 

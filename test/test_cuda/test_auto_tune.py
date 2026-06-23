@@ -93,13 +93,13 @@ DEFAULT_SETTINGS = {
     "batch_size": 8,
     "seqlen": 2048,
     "nsamples": 512,
-    "adam": True,
     "iters": 1000,
     "group_size": 128,
 }
 
 # 128 GB available memory (DGX Spark GB10)
 DGX_SPARK_MEMORY = 128 * 1024 ** 3  # 128 GiB in bytes
+DEFAULT_BUDGET = 96 * 1024 ** 3  # 96 GiB default budget
 
 
 # ---------------------------------------------------------------------------
@@ -109,36 +109,34 @@ DGX_SPARK_MEMORY = 128 * 1024 ** 3  # 128 GiB in bytes
 
 class TestAutoTuneFresh:
     def test_no_adjustment_needed(self, small_config):
-        """Small model with generous memory — no settings changed."""
+        """Small model with generous budget — no settings changed."""
         adjusted, steps = auto_tune(
-            DEFAULT_SETTINGS, small_config, DGX_SPARK_MEMORY, 0.75,
+            DEFAULT_SETTINGS, small_config, DEFAULT_BUDGET,
         )
         assert len(steps) == 0
         assert adjusted == DEFAULT_SETTINGS
 
     def test_batch_size_relaxed_once(self, medium_config):
         """Moderate pressure — batch_size reduces one step (8→4)."""
-        # Compute peak for default settings so we know what budget to set
         from auto_round.compressors.memory_estimator import (
             estimate_peak_memory_per_block,
         )
         peak_bs8, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": DEFAULT_SETTINGS["adam"],
+            "batch_size": 8, "seqlen": 2048,
             "group_size": DEFAULT_SETTINGS["group_size"],
         })
         peak_bs4, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 4, "seqlen": 2048, "adam": DEFAULT_SETTINGS["adam"],
+            "batch_size": 4, "seqlen": 2048,
             "group_size": DEFAULT_SETTINGS["group_size"],
         })
 
         # Budget must be between peak(bs=8) and peak(bs=4) so exactly one step
         assert peak_bs8 > peak_bs4, "expected bs=8 to use more memory than bs=4"
-        midpoint = (peak_bs8 + peak_bs4) / 2
-        budget_bytes = int(midpoint * (1024 ** 3))
-        available = int(budget_bytes / 0.75)
+        midpoint_gb = (peak_bs8 + peak_bs4) / 2
+        budget_bytes = int(midpoint_gb * (1024 ** 3))
 
         adjusted, steps = auto_tune(
-            DEFAULT_SETTINGS, medium_config, available, 0.75,
+            DEFAULT_SETTINGS, medium_config, budget_bytes,
         )
         assert len(steps) >= 1
         assert steps[0]["setting"] == "batch_size"
@@ -155,64 +153,34 @@ class TestAutoTuneFresh:
         # Find a budget that forces at least 2 steps
         # Start with bs=1 (minimum), check peak
         peak_min_bs, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 1, "seqlen": 2048, "adam": DEFAULT_SETTINGS["adam"],
-            "group_size": DEFAULT_SETTINGS["group_size"],
-        })
-        peak_bs2, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 2, "seqlen": 2048, "adam": DEFAULT_SETTINGS["adam"],
+            "batch_size": 1, "seqlen": 2048,
             "group_size": DEFAULT_SETTINGS["group_size"],
         })
 
-        # Budget just below bs=2 peak — forces at least 2 relaxations
+        # Budget just below bs=1 peak — forces at least 2 relaxations
         budget_bytes = int(peak_min_bs * (1024 ** 3))
-        available = int(budget_bytes / 0.75)
 
         adjusted, steps = auto_tune(
-            DEFAULT_SETTINGS, medium_config, available, 0.75,
+            DEFAULT_SETTINGS, medium_config, budget_bytes,
         )
-        # Should have at least 2 steps and batch_size should be ≤ 2
+        # Should have at least 2 steps and batch_size should be ≤ 1
         assert len(steps) >= 2
-        assert adjusted["batch_size"] <= 2
+        assert adjusted["batch_size"] <= 1
         # batch_size should appear in the steps
         batch_steps = [s for s in steps if s["setting"] == "batch_size"]
         assert len(batch_steps) >= 1
 
-    def test_adam_disabled_by_tuner(self, medium_config):
-        """Very tight budget where disabling adam is necessary."""
-        from auto_round.compressors.memory_estimator import (
-            estimate_peak_memory_per_block,
-        )
-
-        # Peak with minimal batch/seqlen but adam ON
-        peak_min_adam_on, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 1, "seqlen": 256, "adam": True,
-            "group_size": DEFAULT_SETTINGS["group_size"],
-        })
-
-        # Set budget below min+adam-on so adam must be disabled
-        budget_bytes = int(peak_min_adam_on * (1024 ** 3) * 0.98)
-        available = int(budget_bytes / 0.75)
-
-        adjusted, steps = auto_tune(
-            DEFAULT_SETTINGS, medium_config, available, 0.75,
-        )
-        setting_names = [s["setting"] for s in steps]
-        # adam should have been relaxed
-        assert "adam" in setting_names
-        assert adjusted["adam"] is False
-
     def test_max_relaxations(self, large_moe_config):
-        """MoE model with 128 GB — all settings should hit minimums."""
+        """MoE model with 128 GB budget — all settings should hit minimums."""
         adjusted, steps = auto_tune(
-            DEFAULT_SETTINGS, large_moe_config, DGX_SPARK_MEMORY, 0.75,
+            DEFAULT_SETTINGS, large_moe_config, DEFAULT_BUDGET,
         )
         # All relaxations should be applied
         assert adjusted["batch_size"] == 1
         assert adjusted["seqlen"] == 256
         assert adjusted["nsamples"] == 128
-        assert adjusted["adam"] is False
-        # Should have 4+ steps (one per ladder entry minimum)
-        assert len(steps) >= 4
+        # Should have 3+ steps (one per ladder entry minimum)
+        assert len(steps) >= 3
         # Verify iters and group_size untouched
         assert adjusted["iters"] == 1000
         assert adjusted["group_size"] == 128
@@ -224,14 +192,14 @@ class TestAutoTuneFresh:
         )
 
         peak_default, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": DEFAULT_SETTINGS["adam"],
+            "batch_size": 8, "seqlen": 2048,
             "group_size": DEFAULT_SETTINGS["group_size"],
         })
         # Tight budget forces relaxations
-        available = int(peak_default * (1024 ** 3) / 0.75 * 0.8)
+        budget_bytes = int(peak_default * (1024 ** 3) * 0.8)
 
         adjusted, steps = auto_tune(
-            DEFAULT_SETTINGS, medium_config, available, 0.75,
+            DEFAULT_SETTINGS, medium_config, budget_bytes,
         )
         assert adjusted["iters"] == 1000
         assert adjusted["group_size"] == 128
@@ -250,14 +218,13 @@ class TestAutoTuneFresh:
         settings["batch_size"] = 2
 
         peak_bs2, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 2, "seqlen": 2048, "adam": settings["adam"],
+            "batch_size": 2, "seqlen": 2048,
             "group_size": settings["group_size"],
         })
         budget_bytes = int(peak_bs2 * (1024 ** 3) * 0.98)
-        available = int(budget_bytes / 0.75)
 
         adjusted, steps = auto_tune(
-            settings, medium_config, available, 0.75,
+            settings, medium_config, budget_bytes,
         )
         # batch_size should go 2→1
         batch_steps = [s for s in steps if s["setting"] == "batch_size"]
@@ -266,33 +233,35 @@ class TestAutoTuneFresh:
             assert batch_steps[0]["new"] == 1
         assert adjusted["batch_size"] <= 1
 
-    def test_different_memory_utilization(self, medium_config):
-        """Lower memory_utilization should trigger stricter relaxations."""
+    def test_different_budget_levels(self, medium_config):
+        """Lower budget should trigger stricter relaxations."""
         from auto_round.compressors.memory_estimator import (
             estimate_peak_memory_per_block,
         )
 
         peak_default, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": DEFAULT_SETTINGS["adam"],
+            "batch_size": 8, "seqlen": 2048,
             "group_size": DEFAULT_SETTINGS["group_size"],
         })
 
-        # Set available so that high utilization fits, low doesn't
-        available = int(peak_default * (1024 ** 3) / 0.95 * 1.05)
+        # Generous budget (fits with no relaxation)
+        generous_budget = int(peak_default * (1024 ** 3) * 1.1)
+        # Tight budget (forces relaxation)
+        tight_budget = int(peak_default * (1024 ** 3) * 0.8)
 
-        adjusted_high, steps_high = auto_tune(
-            DEFAULT_SETTINGS, medium_config, available, 0.9,
+        adjusted_generous, steps_generous = auto_tune(
+            DEFAULT_SETTINGS, medium_config, generous_budget,
         )
-        adjusted_low, steps_low = auto_tune(
-            DEFAULT_SETTINGS, medium_config, available, 0.5,
+        adjusted_tight, steps_tight = auto_tune(
+            DEFAULT_SETTINGS, medium_config, tight_budget,
         )
-        # Lower utilization = tighter budget = more relaxation steps
-        assert len(steps_low) >= len(steps_high)
+        # Tighter budget = more relaxation steps
+        assert len(steps_tight) >= len(steps_generous)
 
     def test_budget_exceeded_at_max_relaxations(self, large_moe_config):
         """Even at max relaxations the MoE model exceeds budget — best-effort."""
         adjusted, steps = auto_tune(
-            DEFAULT_SETTINGS, large_moe_config, DGX_SPARK_MEMORY, 0.75,
+            DEFAULT_SETTINGS, large_moe_config, DEFAULT_BUDGET,
         )
         # Even with everything at minimum, MoE still likely exceeds 96 GB
         # The tuner should still return settings and steps (best effort)
@@ -301,30 +270,6 @@ class TestAutoTuneFresh:
         assert adjusted["batch_size"] == 1
         assert adjusted["seqlen"] == 256
         assert adjusted["nsamples"] == 128
-        assert adjusted["adam"] is False
-
-    def test_adam_false_skips_adam_entry(self, medium_config):
-        """When adam is already disabled, tuner should skip that ladder entry."""
-        settings = dict(DEFAULT_SETTINGS)
-        settings["adam"] = False  # user already disabled adam
-
-        from auto_round.compressors.memory_estimator import (
-            estimate_peak_memory_per_block,
-        )
-        peak_default, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": False,
-            "group_size": DEFAULT_SETTINGS["group_size"],
-        })
-        # Tight budget forces many relaxations
-        available = int(peak_default * (1024 ** 3) / 0.75 * 0.4)
-
-        adjusted, steps = auto_tune(
-            settings, medium_config, available, 0.75,
-        )
-        # adam should stay False (no change applied)
-        assert adjusted["adam"] is False
-        adam_steps = [s for s in steps if s["setting"] == "adam"]
-        assert len(adam_steps) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -340,24 +285,24 @@ class TestAutoTuneResume:
         )
 
         peak_bs8, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": DEFAULT_SETTINGS["adam"],
+            "batch_size": 8, "seqlen": 2048,
             "group_size": DEFAULT_SETTINGS["group_size"],
         })
         # Budget that forces exactly 1 relaxation
         peak_bs4, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 4, "seqlen": 2048, "adam": DEFAULT_SETTINGS["adam"],
+            "batch_size": 4, "seqlen": 2048,
             "group_size": DEFAULT_SETTINGS["group_size"],
         })
-        midpoint = (peak_bs8 + peak_bs4) / 2
-        available = int(midpoint * (1024 ** 3) / 0.75)
+        midpoint_gb = (peak_bs8 + peak_bs4) / 2
+        budget_bytes = int(midpoint_gb * (1024 ** 3))
 
         adjusted, steps = auto_tune(
-            DEFAULT_SETTINGS, medium_config, available, 0.75,
+            DEFAULT_SETTINGS, medium_config, budget_bytes,
             resume_context={"exit_reason": "interrupted", "oom_count": 0},
         )
         # Should be identical to fresh run with same budget
         adjusted_fresh, steps_fresh = auto_tune(
-            DEFAULT_SETTINGS, medium_config, available, 0.75,
+            DEFAULT_SETTINGS, medium_config, budget_bytes,
         )
         assert adjusted == adjusted_fresh
         assert steps == steps_fresh
@@ -369,14 +314,14 @@ class TestAutoTuneResume:
         )
 
         peak_bs8, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": DEFAULT_SETTINGS["adam"],
+            "batch_size": 8, "seqlen": 2048,
             "group_size": DEFAULT_SETTINGS["group_size"],
         })
         # Tighter budget
-        available = int(peak_bs8 * (1024 ** 3) / 0.75 * 0.7)
+        budget_bytes = int(peak_bs8 * (1024 ** 3) * 0.7)
 
         adjusted_resume, steps_resume = auto_tune(
-            DEFAULT_SETTINGS, medium_config, available, 0.75,
+            DEFAULT_SETTINGS, medium_config, budget_bytes,
             resume_context={"exit_reason": "oom", "oom_count": 0},
         )
         # OOM resume should have at least one skipped step
@@ -385,7 +330,7 @@ class TestAutoTuneResume:
 
         # Without OOM context, fewer steps (no skip)
         adjusted_fresh, steps_fresh = auto_tune(
-            DEFAULT_SETTINGS, medium_config, available, 0.75,
+            DEFAULT_SETTINGS, medium_config, budget_bytes,
         )
         # OOM version should have same or more total steps but with skip markers
         # (skipped steps are included in steps list with skipped=True)
@@ -398,13 +343,13 @@ class TestAutoTuneResume:
         )
 
         peak_default, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": DEFAULT_SETTINGS["adam"],
+            "batch_size": 8, "seqlen": 2048,
             "group_size": DEFAULT_SETTINGS["group_size"],
         })
-        tight = int(peak_default * (1024 ** 3) / 0.75 * 0.6)
+        budget_bytes = int(peak_default * (1024 ** 3) * 0.6)
 
         adjusted, steps = auto_tune(
-            DEFAULT_SETTINGS, medium_config, tight, 0.75,
+            DEFAULT_SETTINGS, medium_config, budget_bytes,
             resume_context={"exit_reason": "oom", "oom_count": 3},
         )
         # oom_count=3 → skip = 1 + (3//2) = 2
@@ -418,17 +363,17 @@ class TestAutoTuneResume:
         )
 
         peak_default, _ = estimate_peak_memory_per_block(medium_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": DEFAULT_SETTINGS["adam"],
+            "batch_size": 8, "seqlen": 2048,
             "group_size": DEFAULT_SETTINGS["group_size"],
         })
-        tight = int(peak_default * (1024 ** 3) / 0.75 * 0.7)
+        budget_bytes = int(peak_default * (1024 ** 3) * 0.7)
 
         adjusted, steps = auto_tune(
-            DEFAULT_SETTINGS, medium_config, tight, 0.75,
+            DEFAULT_SETTINGS, medium_config, budget_bytes,
             resume_context=None,
         )
         adjusted_fresh, _ = auto_tune(
-            DEFAULT_SETTINGS, medium_config, tight, 0.75,
+            DEFAULT_SETTINGS, medium_config, budget_bytes,
         )
         assert adjusted == adjusted_fresh
 
@@ -442,23 +387,21 @@ class TestFormatMessages:
     def test_preflight_no_adjustment(self):
         """Happy path — no adjustments needed."""
         msg = format_preflight_message(
-            {"batch_size": 8, "seqlen": 2048, "nsamples": 512, "adam": True},
-            {"batch_size": 8, "seqlen": 2048, "nsamples": 512, "adam": True},
+            {"batch_size": 8, "seqlen": 2048, "nsamples": 512},
+            {"batch_size": 8, "seqlen": 2048, "nsamples": 512},
             steps=[],
             peak_gb=42.5,
             budget_gb=96.0,
-            memory_utilization=0.75,
         )
         assert "Memory OK" in msg
         assert "42.5" in msg
         assert "96.0" in msg
-        assert "75%" in msg
 
     def test_preflight_single_adjustment(self):
         """Single adjustment displayed correctly."""
         msg = format_preflight_message(
-            {"batch_size": 8, "seqlen": 2048, "nsamples": 512, "adam": True},
-            {"batch_size": 4, "seqlen": 2048, "nsamples": 512, "adam": True},
+            {"batch_size": 8, "seqlen": 2048, "nsamples": 512},
+            {"batch_size": 4, "seqlen": 2048, "nsamples": 512},
             steps=[
                 {
                     "setting": "batch_size", "old": 8, "new": 4,
@@ -467,7 +410,6 @@ class TestFormatMessages:
             ],
             peak_gb=58.0,
             budget_gb=96.0,
-            memory_utilization=0.75,
         )
         assert "Memory budget exceeded" in msg
         assert "batch_size" in msg
@@ -479,8 +421,8 @@ class TestFormatMessages:
     def test_preflight_multiple_adjustments(self):
         """Multiple adjustments each on their own line."""
         msg = format_preflight_message(
-            {"batch_size": 8, "seqlen": 2048, "nsamples": 512, "adam": True},
-            {"batch_size": 2, "seqlen": 1024, "nsamples": 512, "adam": True},
+            {"batch_size": 8, "seqlen": 2048, "nsamples": 512},
+            {"batch_size": 2, "seqlen": 1024, "nsamples": 512},
             steps=[
                 {
                     "setting": "batch_size", "old": 8, "new": 4,
@@ -497,7 +439,6 @@ class TestFormatMessages:
             ],
             peak_gb=72.0,
             budget_gb=96.0,
-            memory_utilization=0.75,
         )
         assert "batch_size" in msg
         assert "seqlen" in msg
@@ -506,8 +447,8 @@ class TestFormatMessages:
     def test_preflight_with_skipped(self):
         """Skipped steps (OOM resume) shown as additional info."""
         msg = format_preflight_message(
-            {"batch_size": 8, "seqlen": 2048, "nsamples": 512, "adam": True},
-            {"batch_size": 2, "seqlen": 2048, "nsamples": 512, "adam": True},
+            {"batch_size": 8, "seqlen": 2048, "nsamples": 512},
+            {"batch_size": 2, "seqlen": 2048, "nsamples": 512},
             steps=[
                 {
                     "setting": "batch_size", "old": 8, "new": 4,
@@ -520,19 +461,17 @@ class TestFormatMessages:
             ],
             peak_gb=65.0,
             budget_gb=96.0,
-            memory_utilization=0.75,
         )
         assert "additionally" in msg or "skipped" in msg
 
     def test_preflight_still_exceeds_budget(self):
         """Warning indicator when peak still exceeds budget."""
         msg = format_preflight_message(
-            {"batch_size": 1, "seqlen": 256, "nsamples": 128, "adam": False},
-            {"batch_size": 1, "seqlen": 256, "nsamples": 128, "adam": False},
+            {"batch_size": 1, "seqlen": 256, "nsamples": 128},
+            {"batch_size": 1, "seqlen": 256, "nsamples": 128},
             steps=[],
             peak_gb=320.0,
             budget_gb=96.0,
-            memory_utilization=0.75,
         )
         # No adjustments to show, but peak exceeds budget
         assert "still exceeds budget" in msg or "⚠" in msg
@@ -544,7 +483,7 @@ class TestFormatMessages:
             exit_reason="oom",
             adjusted_settings={
                 "batch_size": 2, "seqlen": 2048,
-                "nsamples": 512, "adam": False,
+                "nsamples": 512,
             },
             steps=[
                 {
@@ -554,7 +493,6 @@ class TestFormatMessages:
             ],
             peak_gb=35.0,
             budget_gb=83.2,
-            memory_utilization=0.65,
         )
         assert "Resuming from block 9/48" in msg
         assert "OOM'd" in msg
@@ -569,12 +507,11 @@ class TestFormatMessages:
             exit_reason="interrupted",
             adjusted_settings={
                 "batch_size": 8, "seqlen": 2048,
-                "nsamples": 512, "adam": True,
+                "nsamples": 512,
             },
             steps=[],
             peak_gb=42.0,
             budget_gb=96.0,
-            memory_utilization=0.75,
         )
         assert "interrupted" in msg
         assert "user stopped" in msg
@@ -586,7 +523,7 @@ class TestFormatMessages:
             exit_reason="oom",
             adjusted_settings={
                 "batch_size": 4, "seqlen": 2048,
-                "nsamples": 512, "adam": True,
+                "nsamples": 512,
             },
             oom_count=2,
             steps=[
@@ -597,7 +534,6 @@ class TestFormatMessages:
             ],
             peak_gb=75.0,
             budget_gb=96.0,
-            memory_utilization=0.75,
         )
         assert "OOM count" in msg
         assert "Accelerating" in msg
@@ -609,12 +545,11 @@ class TestFormatMessages:
             exit_reason="crash",
             adjusted_settings={
                 "batch_size": 8, "seqlen": 2048,
-                "nsamples": 512, "adam": True,
+                "nsamples": 512,
             },
             steps=[],
             peak_gb=42.0,
             budget_gb=96.0,
-            memory_utilization=0.75,
         )
         assert "crash" in msg
         assert "Resuming from block 1/48" in msg
@@ -684,16 +619,14 @@ class TestResolveResumeOffset:
 
 class TestRelaxationLadder:
     def test_ladder_has_required_entries(self):
-        """Ladder must have batch_size, seqlen, nsamples, adam entries."""
+        """Ladder must have batch_size, seqlen, nsamples entries."""
         keys = [e["key"] for e in _RELAXATION_LADDER]
         assert "batch_size" in keys
         assert "seqlen" in keys
         assert "nsamples" in keys
-        assert "adam" in keys
         # Must be in this order
         assert keys.index("batch_size") < keys.index("seqlen")
         assert keys.index("seqlen") < keys.index("nsamples")
-        assert keys.index("nsamples") < keys.index("adam")
 
     def test_each_entry_has_required_fields(self):
         """Each ladder entry must have key, levels, and impact."""
@@ -704,7 +637,47 @@ class TestRelaxationLadder:
             assert len(entry["levels"]) >= 2  # at least one relaxation possible
 
     def test_never_auto_tune_not_in_ladder(self):
-        """iters and group_size must NOT be in the ladder."""
+        """iters, group_size, and adam must NOT be in the ladder."""
         keys = [e["key"] for e in _RELAXATION_LADDER]
         assert "iters" not in keys
         assert "group_size" not in keys
+        # adam should also not be in the ladder (dead code)
+        assert "adam" not in keys
+
+
+# ---------------------------------------------------------------------------
+# Memory budget tests
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryBudget:
+    """Tests for the --memory-budget flag behavior."""
+
+    def test_budget_bytes_is_direct_ceiling(self, small_config):
+        """budget_bytes is used directly — no multiplication."""
+        # If budget is exactly peak, it should fit (peak <= budget)
+        from auto_round.compressors.memory_estimator import (
+            estimate_peak_memory_per_block,
+        )
+        # Use same settings as the auto_tune call
+        settings = dict(DEFAULT_SETTINGS)
+        peak, _ = estimate_peak_memory_per_block(small_config, {
+            "batch_size": 8, "seqlen": 2048,
+            "group_size": settings["group_size"],
+        })
+        budget_bytes = int(peak * (1024 ** 3))
+        adjusted, steps = auto_tune(
+            settings, small_config, budget_bytes,
+        )
+        # Should fit with no relaxation
+        assert len(steps) == 0
+
+    def test_budget_below_minimum_triggers_all_relaxations(self, large_moe_config):
+        """Very small budget forces all settings to minimums."""
+        adjusted, steps = auto_tune(
+            DEFAULT_SETTINGS, large_moe_config, 1 * (1024 ** 3),  # 1 GiB
+        )
+        assert adjusted["batch_size"] == 1
+        assert adjusted["seqlen"] == 256
+        assert adjusted["nsamples"] == 128
+        assert len(steps) >= 3

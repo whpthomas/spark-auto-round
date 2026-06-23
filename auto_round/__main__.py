@@ -75,9 +75,6 @@ class BasicArgumentParser(argparse.ArgumentParser):
         )
         basic.add_argument("--seed", default=42, type=int, help="Random seed for reproducibility.")
         basic.add_argument(
-            "--adam", action="store_true", help="Use Adam optimizer instead of SignSGD."
-        )
-        basic.add_argument(
             "--disable_torch_compile",
             action="store_true",
             help="Disable torch.compile (enabled by default).",
@@ -89,6 +86,14 @@ class BasicArgumentParser(argparse.ArgumentParser):
             help="Memory utilization threshold (50-95). Models using more than "
                  "this percentage of available memory trigger block-by-block "
                  "offloading to disk. Default: 75.",
+        )
+        basic.add_argument(
+            "--memory_budget",
+            default=96,
+            type=int,
+            help="Per-block memory budget in GiB for the auto-tuner. "
+                 "Default: 96 (75%% of 128 GiB). Max: 120. "
+                 "Sets a hard ceiling on estimated peak memory per block.",
         )
         basic.add_argument(
             "--trust-remote-code",
@@ -124,14 +129,6 @@ class BasicArgumentParser(argparse.ArgumentParser):
             default=None,
             type=float,
             help="MinMax learning rate (optional, uses --lr).",
-        )
-        tuning.add_argument(
-            "--memory_safety_margin",
-            type=int,
-            default=0,
-            choices=range(0, 21),
-            help="Extra percentage points to tighten memory_utilization (0-20). "
-                 "Useful if you experience repeated OOMs.",
         )
 
         scheme = self.add_argument_group("Scheme Arguments")
@@ -238,16 +235,19 @@ def tune(args):
         model_config = None
 
     if model_config is not None:
-        available_memory = torch.cuda.mem_get_info(0)[0]  # free + used
-        effective_utilization = memory_utilization - args.memory_safety_margin / 100.0
-        effective_utilization = max(0.50, min(0.95, effective_utilization))  # clamp [0.50, 0.95]
+        # Budget from --memory-budget flag (direct GiB ceiling)
+        budget_bytes = min(args.memory_budget, 120) * (1024 ** 3)
+        if args.memory_budget < 16:
+            logger.warning(
+                "Very low --memory_budget (%d GiB) — aggressive relaxations "
+                "will be applied.", args.memory_budget
+            )
 
         # Build user_settings dict for the auto-tuner
         user_settings = {
             "batch_size": args.batch_size,
             "seqlen": args.seqlen,
             "nsamples": args.nsamples,
-            "adam": args.adam,
             "iters": args.iters,
             "group_size": args.group_size,
         }
@@ -279,12 +279,11 @@ def tune(args):
             except (json.JSONDecodeError, OSError):
                 pass
 
-        # Run auto-tuner
+        # Run auto-tuner with budget_bytes
         adjusted_settings, tune_steps = auto_tune(
             user_settings=user_settings,
             model_config=model_config,
-            available_memory=available_memory,
-            memory_utilization=effective_utilization,
+            budget_bytes=budget_bytes,
             resume_context=resume_context,
         )
 
@@ -293,7 +292,6 @@ def tune(args):
         peak_gb, _ = estimate_peak_memory_per_block(
             model_config, adjusted_settings,
         )
-        budget_gb = available_memory * effective_utilization / (1024 ** 3)
 
         # Display message
         if resume_mode:
@@ -305,8 +303,7 @@ def tune(args):
                 adjusted_settings=adjusted_settings,
                 steps=tune_steps,
                 peak_gb=peak_gb,
-                budget_gb=budget_gb,
-                memory_utilization=effective_utilization,
+                budget_gb=budget_bytes / (1024 ** 3),
                 oom_count=oom_count,
             )
         else:
@@ -315,8 +312,7 @@ def tune(args):
                 adjusted_settings=adjusted_settings,
                 steps=tune_steps,
                 peak_gb=peak_gb,
-                budget_gb=budget_gb,
-                memory_utilization=effective_utilization,
+                budget_gb=budget_bytes / (1024 ** 3),
             )
         logger.info(msg)
 
@@ -324,7 +320,6 @@ def tune(args):
         args.batch_size = adjusted_settings.get("batch_size", args.batch_size)
         args.seqlen = adjusted_settings.get("seqlen", args.seqlen)
         args.nsamples = adjusted_settings.get("nsamples", args.nsamples)
-        args.adam = adjusted_settings.get("adam", args.adam)
 
         # Build tuning_profile for checkpoint metadata (Phase 3)
         tuning_profile = {
@@ -336,7 +331,6 @@ def tune(args):
                 "batch_size": args.batch_size,
                 "seqlen": args.seqlen,
                 "nsamples": args.nsamples,
-                "adam": args.adam,
             },
         }
     else:
@@ -344,7 +338,6 @@ def tune(args):
         adjusted_settings = {}
         tune_steps = []
         peak_gb = 0.0
-        budget_gb = 0.0
         tuning_profile = None
 
     from auto_round import AutoRound
@@ -406,7 +399,6 @@ def tune(args):
         enable_torch_compile=enable_torch_compile,
         seed=args.seed,
         not_use_best_mse=False,
-        enable_adam=args.adam,
         extra_config=extra_config,
         layer_config=layer_config,
         model_dtype=args.model_dtype,
@@ -417,13 +409,12 @@ def tune(args):
         rotation_config=None,
         algorithm=None,
         use_meta_device=use_meta_device,
+        tuning_profile=tuning_profile,
     )
 
-    # Pass tuning_profile to the compressor for checkpoint metadata
-    if hasattr(autoround, '_tuning_profile') and tuning_profile is not None:
-        autoround._tuning_profile = tuning_profile
+    # Reset exit_reason for fresh start (state initialization, not duck-typing)
     if hasattr(autoround, '_exit_reason'):
-        autoround._exit_reason = None  # fresh start
+        autoround._exit_reason = None
 
     # Quantize and save
     model, folders = autoround.quantize_and_save(args.output_dir, format=format)

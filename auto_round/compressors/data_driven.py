@@ -91,13 +91,14 @@ class DataDrivenCompressor(BaseCompressor):
         enable_torch_compile: bool = False,
         seed: int = 42,
         low_cpu_mem_usage: bool = True,
+        tuning_profile: Optional[dict] = None,
         **kwargs,
     ):
         self.iters = iters
         self.clear_cache = kwargs.pop("clear_cache", False)
         self._checkpoint_block_idx = 0
         self._exit_reason: Optional[str] = None
-        self._tuning_profile: Optional[dict] = kwargs.pop("tuning_profile", None)
+        self._tuning_profile = tuning_profile
         super().__init__(
             config=config,
             model=model,

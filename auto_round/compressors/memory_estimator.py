@@ -21,7 +21,7 @@ Usage:
     from auto_round.compressors.memory_estimator import estimate_peak_memory_per_block
 
     peak_gb, breakdown = estimate_peak_memory_per_block(config, {
-        "batch_size": 8, "seqlen": 2048, "adam": True
+        "batch_size": 8, "seqlen": 2048,
     })
 """
 
@@ -49,7 +49,6 @@ def estimate_peak_memory_per_block(
         Must contain keys:
             batch_size : int
             seqlen : int
-            adam : bool         (True if --adam is enabled)
         Optionally:
             nsamples : int      (informational; does not affect GPU peak)
             group_size : int    (default 128)
@@ -70,7 +69,6 @@ def estimate_peak_memory_per_block(
 
     bs = user_settings["batch_size"]
     seqlen = user_settings["seqlen"]
-    adam_enabled = user_settings.get("adam", False)
 
     # -- Extract model dimensions -------------------------------------------
     dims = _get_hidden_dimensions(config)
@@ -105,11 +103,23 @@ def estimate_peak_memory_per_block(
     activation_bytes = bs * seqlen * hidden * 2 * top_k  # forward
     gradient_bytes = activation_bytes  # backward (same shape)
 
+    # Attention scores: bs × num_heads × seqlen × seqlen × 2 (bf16)
+    # This is the Q×K^T matrix — dominates memory for long sequences.
+    # For GQA (grouped query attention), use num_key_value_heads.
+    num_heads = dims.get("num_key_value_heads") or dims.get("num_attention_heads", 1)
+    attention_scores_bytes = bs * num_heads * seqlen * seqlen * 2
+
+    # QKV intermediates: stored for backward pass gradient computation
+    # Q, K, V each: bs × seqlen × hidden × 2 (bf16)
+    qkv_intermediate_bytes = 3 * bs * seqlen * hidden * 2
+
+    # FFN intermediates: gate and up projection outputs, stored for backward
+    # Each: bs × seqlen × intermediate × 2 (bf16)
+    intermediate = dims["intermediate_size"]
+    ffn_intermediate_bytes = 2 * bs * seqlen * intermediate * 2
+
     # Calibration input batch (on GPU during forward)
     calibration_bytes = bs * seqlen * hidden * 2
-
-    # Adam momentum (two fp32 buffers per tunable Wrapper param)
-    adam_bytes = (2 * block_params * 4) if adam_enabled else 0
 
     # -- Total --------------------------------------------------------------
     components = {
@@ -118,12 +128,20 @@ def estimate_peak_memory_per_block(
         "wrapper_scales_fp32": wrapper_scale_bytes,
         "activation_forward": activation_bytes,
         "activation_backward": gradient_bytes,
+        "attention_scores": attention_scores_bytes,
+        "qkv_intermediate": qkv_intermediate_bytes,
+        "ffn_intermediate": ffn_intermediate_bytes,
         "calibration_input": calibration_bytes,
-        "adam_momentum": adam_bytes,
     }
 
     total_bytes = sum(components.values())
-    safety_factor = 1.15
+    # 1.50× safety factor accounts for:
+    # - PyTorch CUDA allocator fragmentation overhead (~5-10%)
+    # - Autograd computation graph metadata (~15-20%)
+    # - Additional intermediate tensors not explicitly modeled
+    # - torch.compile kernel fusion effects
+    # - System-level memory overhead
+    safety_factor = 1.50
     peak_gb = (total_bytes * safety_factor) / (1024 ** 3)
 
     # Return breakdown in GiB for readability
@@ -287,7 +305,3 @@ def _validate_settings(settings: Dict[str, Any]) -> None:
         val = settings[key]
         if not isinstance(val, int) or val < 1:
             raise ValueError(f"'{key}' must be a positive int, got {val}")
-
-    if "adam" in settings:
-        if not isinstance(settings["adam"], bool):
-            raise ValueError(f"'adam' must be a bool, got {type(settings['adam'])}")

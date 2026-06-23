@@ -13,8 +13,10 @@
 # limitations under the License.
 """Tests for auto_round.compressors.memory_estimator."""
 
+import gc
 import math
 import pytest
+import torch
 
 from auto_round.compressors.memory_estimator import (
     estimate_peak_memory_per_block,
@@ -203,41 +205,31 @@ class TestGetBlockParams:
 
 class TestEstimatePeakMemory:
     def test_llama_defaults(self, llama_config):
-        """Llama-7B block with default settings (bs=8, seqlen=2048, adam=False)."""
+        """Llama-7B block with default settings (bs=8, seqlen=2048)."""
         peak, breakdown = estimate_peak_memory_per_block(llama_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": False,
+            "batch_size": 8, "seqlen": 2048,
         })
-        # Quick sanity: should be < 4 GB for a 7B model block
+        # Quick sanity: should be < 10 GB for a 7B model block
         assert peak > 0
         assert peak < 10.0
-        # Check all breakdown keys present
+        # Check all breakdown keys present (includes intermediate tensors)
         expected_keys = {
             "block_weights_bf16", "wrapper_value_fp32", "wrapper_scales_fp32",
-            "activation_forward", "activation_backward", "calibration_input",
-            "adam_momentum", "safety_margin", "total_estimated",
+            "activation_forward", "activation_backward",
+            "attention_scores", "qkv_intermediate", "ffn_intermediate",
+            "calibration_input", "safety_margin", "total_estimated",
         }
         assert set(breakdown.keys()) == expected_keys
         # total_estimated should round to peak
         assert round(breakdown["total_estimated"], 2) == peak
 
-    def test_llama_with_adam(self, llama_config):
-        """Adam adds momentum buffers — verify increase."""
-        peak_no_adam, _ = estimate_peak_memory_per_block(llama_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": False,
-        })
-        peak_adam, _ = estimate_peak_memory_per_block(llama_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": True,
-        })
-        # Adam adds 2 * block_params * 4 bytes — should be noticeable
-        assert peak_adam > peak_no_adam
-
     def test_batch_size_reduces_memory(self, llama_config):
         """Halving batch_size should roughly halve activation components."""
         peak_bs8, _ = estimate_peak_memory_per_block(llama_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": False,
+            "batch_size": 8, "seqlen": 2048,
         })
         peak_bs4, _ = estimate_peak_memory_per_block(llama_config, {
-            "batch_size": 4, "seqlen": 2048, "adam": False,
+            "batch_size": 4, "seqlen": 2048,
         })
         # Activation components should be ~half
         # (weight components stay same, so reduction < 50% of total)
@@ -246,17 +238,17 @@ class TestEstimatePeakMemory:
     def test_seqlen_reduces_memory(self, llama_config):
         """Halving seqlen should roughly halve activation components."""
         peak_2048, _ = estimate_peak_memory_per_block(llama_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": False,
+            "batch_size": 8, "seqlen": 2048,
         })
         peak_1024, _ = estimate_peak_memory_per_block(llama_config, {
-            "batch_size": 8, "seqlen": 1024, "adam": False,
+            "batch_size": 8, "seqlen": 1024,
         })
         assert peak_1024 < peak_2048
 
     def test_qwen_moe_memory_gigantic(self, qwen_moe_config):
         """Qwen3.5-122B-A10B per-block memory should be large (~100+ GB)."""
         peak, breakdown = estimate_peak_memory_per_block(qwen_moe_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": True,
+            "batch_size": 8, "seqlen": 2048,
         })
         # Each MoE block has ~155B params, so > 300 GB even without activations
         # This confirms why users OOM on 128 GB
@@ -265,9 +257,9 @@ class TestEstimatePeakMemory:
         assert breakdown["block_weights_bf16"] > breakdown["activation_forward"] * 10
 
     def test_qwen_moe_minimal_settings(self, qwen_moe_config):
-        """Qwen3.5-122B-A10B with bs=1, seqlen=512, no adam — barely fits 128 GB."""
+        """Qwen3.5-122B-A10B with bs=1, seqlen=512 — barely fits 128 GB."""
         peak, breakdown = estimate_peak_memory_per_block(qwen_moe_config, {
-            "batch_size": 1, "seqlen": 512, "adam": False,
+            "batch_size": 1, "seqlen": 512,
         })
         # Even minimal settings: ~310 GB for weights alone in bf16
         # (155B params × 2 bytes = 310 GB + wrapper = ~930 GB)
@@ -277,7 +269,7 @@ class TestEstimatePeakMemory:
     def test_smol_model_fits_easily(self, smol_config):
         """SmolLM-135M should fit easily in any GPU (<< 2 GB per block)."""
         peak, _ = estimate_peak_memory_per_block(smol_config, {
-            "batch_size": 8, "seqlen": 2048, "adam": False,
+            "batch_size": 8, "seqlen": 2048,
         })
         assert peak < 2.0
 
@@ -289,8 +281,6 @@ class TestEstimatePeakMemory:
             estimate_peak_memory_per_block(llama_config, {"batch_size": 0, "seqlen": 2048})
         with pytest.raises(ValueError):
             estimate_peak_memory_per_block(llama_config, {"batch_size": 8, "seqlen": -1})
-        with pytest.raises(ValueError):
-            estimate_peak_memory_per_block(llama_config, {"batch_size": 8, "seqlen": 2048, "adam": 42})
 
 
 # ---------------------------------------------------------------------------
@@ -300,34 +290,34 @@ class TestEstimatePeakMemory:
 
 class TestEdgeCases:
     def test_safety_factor_applied(self, llama_config):
-        """Verify safety factor of 1.15 is applied."""
+        """Verify safety factor of 1.50 is applied."""
         peak, breakdown = estimate_peak_memory_per_block(llama_config, {
-            "batch_size": 1, "seqlen": 1, "adam": False,
+            "batch_size": 1, "seqlen": 1,
         })
         # Compute pre-safety total
-        pre_safety = peak / 1.15
+        pre_safety = peak / 1.50
         # Breakdown safety_margin should be peak - pre_safety
         assert abs(breakdown["safety_margin"] - (peak - pre_safety)) < 0.01
 
     def test_components_sum_to_total(self, llama_config):
         """Pre-safety components + safety_margin should sum to total_estimated."""
         peak, breakdown = estimate_peak_memory_per_block(llama_config, {
-            "batch_size": 1, "seqlen": 1, "adam": False,
+            "batch_size": 1, "seqlen": 1,
         })
         # Sum all pre-safety components
         pre_safety_keys = [k for k in breakdown if k not in ("safety_margin", "total_estimated")]
         pre_safety_sum = sum(breakdown[k] for k in pre_safety_keys)
         # Apply safety to pre_safety_sum
-        expected_peak = round(pre_safety_sum * 1.15, 2)
+        expected_peak = round(pre_safety_sum * 1.50, 2)
         assert peak == expected_peak
 
     def test_group_size_affects_wrapper_scales(self, llama_config):
         """Changing group_size should affect wrapper scale memory slightly."""
         _, b1 = estimate_peak_memory_per_block(llama_config, {
-            "batch_size": 1, "seqlen": 1, "adam": False, "group_size": 32,
+            "batch_size": 1, "seqlen": 1, "group_size": 32,
         })
         _, b2 = estimate_peak_memory_per_block(llama_config, {
-            "batch_size": 1, "seqlen": 1, "adam": False, "group_size": 256,
+            "batch_size": 1, "seqlen": 1, "group_size": 256,
         })
         # group_size=32 → more scales → higher wrapper_scale_bytes
         assert b1["wrapper_scales_fp32"] > b2["wrapper_scales_fp32"]
@@ -335,21 +325,232 @@ class TestEdgeCases:
     def test_moe_activations_scale_with_top_k(self, qwen_moe_config):
         """MoE activations should account for top_k routing."""
         peak, breakdown = estimate_peak_memory_per_block(qwen_moe_config, {
-            "batch_size": 1, "seqlen": 1, "adam": False,
+            "batch_size": 1, "seqlen": 1,
         })
         # top_k=8 means activations are 8× larger than dense equivalent
         assert breakdown["activation_forward"] > 0
 
-    def test_adam_zero_when_disabled(self, llama_config):
-        """adam_momentum should be exactly 0 when adam=False."""
-        _, breakdown = estimate_peak_memory_per_block(llama_config, {
-            "batch_size": 1, "seqlen": 1, "adam": False,
-        })
-        assert breakdown["adam_momentum"] == 0.0
 
-    def test_adam_nonzero_when_enabled(self, llama_config):
-        """adam_momentum should be > 0 when adam=True."""
-        _, breakdown = estimate_peak_memory_per_block(llama_config, {
-            "batch_size": 1, "seqlen": 1, "adam": True,
-        })
-        assert breakdown["adam_momentum"] > 0.0
+# ---------------------------------------------------------------------------
+# CUDA Integration Tests — validate estimator against real GPU measurements
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def tiny_model_fixture():
+    """Load SmolLM-135M (tiny dense model) for CUDA integration tests.
+
+    Uses transformers to load a real model so the test exercises the full
+    forward/backward path with real tensors (not mocks).
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    model_name = "HuggingFaceTB/SmolLM-135M"
+    try:
+        config = AutoConfig.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, config=config, torch_dtype=torch.bfloat16
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    except Exception as exc:
+        pytest.skip(f"Could not load {model_name}: {exc}")
+
+    model.config._name_or_path = model_name  # ensure config has name
+    yield model, tokenizer, config
+
+    del model, tokenizer, config
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
+def estimator_prediction(tiny_model_fixture):
+    """Run the estimator for SmolLM-135M with default settings."""
+    _, _, config = tiny_model_fixture
+    settings = {
+        "batch_size": 8,
+        "seqlen": 2048,
+        "group_size": 128,
+    }
+    peak_gb, breakdown = estimate_peak_memory_per_block(config, settings)
+    return peak_gb, breakdown, settings
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA not available"
+)
+class TestMemoryEstimatorCUDA:
+    """Validate memory estimator against real GPU peak memory measurements.
+
+    These tests require a CUDA GPU and load a tiny model (SmolLM-135M).
+    They run the forward/backward/optimizer cycle on a single block and
+    compare torch.cuda.max_memory_allocated() to the estimator's prediction.
+    """
+
+    @pytest.mark.cuda
+    def test_estimator_prediction_is_reasonable(self, estimator_prediction):
+        """Sanity check: SmolLM-135M prediction should be < 2 GB."""
+        peak_gb, breakdown, _ = estimator_prediction
+        assert peak_gb > 0, "Estimator should predict positive memory"
+        assert peak_gb < 2.0, f"SmolLM-135M prediction too large: {peak_gb} GB"
+
+    @pytest.mark.cuda
+    def test_peak_memory_within_tolerance(self, tiny_model_fixture, estimator_prediction):
+        """Real GPU peak should be within ±30% of estimator prediction.
+
+        Tolerance rationale (from design brief):
+        - Validates safety factor is adequate without being brittle
+        - Accounts for CUDA allocator fragmentation, torch.compile effects,
+          system-level noise
+        - If this fails, the safety factor needs adjustment
+
+        NOTE: If this test fails with measured >> predicted, it reveals the
+        estimator significantly underestimates real GPU memory usage.
+        """
+        model, tokenizer, config = tiny_model_fixture
+        predicted_gb, _, settings = estimator_prediction
+
+        device = torch.device("cuda:0")
+
+        # Extract the first transformer block and move only it to GPU
+        # (not the entire model — we want to measure block-level memory only)
+        block = model.model.layers[0].to(device).to(torch.bfloat16)
+
+        # Create a dummy input matching the estimator's settings
+        bs = settings["batch_size"]
+        seqlen = settings["seqlen"]
+        hidden = config.hidden_size
+
+        # Create hidden states as input (bypasses embedding layer)
+        dummy_input = torch.randn(bs, seqlen, hidden, dtype=torch.bfloat16, device=device)
+
+        # Compute position embeddings using a temporary rotary_emb on GPU
+        # We need the model's rotary_emb config, but move it to GPU temporarily
+        rotary_emb = model.model.rotary_emb.to(device)
+        position_ids = torch.arange(seqlen, device=device).unsqueeze(0).expand(bs, -1)
+        position_embeddings = rotary_emb(dummy_input, position_ids=position_ids)
+        # Move rotary_emb back to CPU to avoid counting its memory
+        model.model.rotary_emb = rotary_emb.cpu()
+        del rotary_emb
+
+        # Clear any prior memory stats
+        torch.cuda.reset_peak_memory_stats()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Record baseline (just the block weights on GPU)
+        baseline_bytes = torch.cuda.max_memory_allocated()
+
+        # Run forward pass through the block
+        # Use no_grad first to measure forward-only peak
+        with torch.no_grad():
+            output = block(dummy_input, position_embeddings=position_embeddings)
+
+        forward_peak = torch.cuda.max_memory_allocated()
+
+        # Now run with grad to measure forward + backward peak
+        torch.cuda.reset_peak_memory_stats()
+        dummy_input_grad = torch.randn(bs, seqlen, hidden, dtype=torch.bfloat16, device=device)
+        dummy_input_grad.requires_grad_(True)
+
+        output = block(dummy_input_grad, position_embeddings=position_embeddings)
+        if isinstance(output, tuple):
+            loss = output[0].sum()
+        else:
+            loss = output.sum()
+        loss.backward()
+
+        fwd_bwd_peak = torch.cuda.max_memory_allocated()
+
+        # The higher of forward-only and fwd+bwd is our measured peak
+        # (forward-only captures activation memory, fwd+bwd captures gradients)
+        measured_peak_bytes = max(forward_peak, fwd_bwd_peak)
+        measured_peak_gb = measured_peak_bytes / (1024 ** 3)
+
+        # Clean up
+        del block, dummy_input, dummy_input_grad, output, loss, position_embeddings
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Tolerance check: prediction within ±30% of measured
+        lower_bound = predicted_gb * 0.70
+        upper_bound = predicted_gb * 1.30
+
+        if not (lower_bound <= measured_peak_gb <= upper_bound):
+            ratio = measured_peak_gb / predicted_gb if predicted_gb > 0 else float('inf')
+            pytest.fail(
+                f"Memory estimator prediction ({predicted_gb:.3f} GB) differs from "
+                f"measured peak ({measured_peak_gb:.3f} GB) by {ratio:.1f}× "
+                f"(expected ±30%). "
+                f"The estimator significantly underestimates real GPU memory usage. "
+                f"Consider: (1) increasing safety factor from 1.15× to ~{ratio:.1f}×, "
+                f"or (2) fixing the formula to account for intermediate tensors."
+            )
+
+    @pytest.mark.cuda
+    def test_safety_factor_provides_headroom(self, tiny_model_fixture, estimator_prediction):
+        """Estimator prediction should be ABOVE measured peak (safety headroom).
+
+        The 1.15× safety factor means predicted > measured. If this fails,
+        the safety factor is too low and needs increase.
+
+        NOTE: If this test fails with predicted << measured, it reveals the
+        estimator significantly underestimates real GPU memory usage.
+        """
+        model, tokenizer, config = tiny_model_fixture
+        predicted_gb, _, settings = estimator_prediction
+
+        device = torch.device("cuda:0")
+
+        # Extract the first transformer block and move only it to GPU
+        block = model.model.layers[0].to(device).to(torch.bfloat16)
+
+        bs = settings["batch_size"]
+        seqlen = settings["seqlen"]
+        hidden = config.hidden_size
+
+        dummy_input = torch.randn(bs, seqlen, hidden, dtype=torch.bfloat16, device=device)
+
+        # Compute position embeddings
+        rotary_emb = model.model.rotary_emb.to(device)
+        position_ids = torch.arange(seqlen, device=device).unsqueeze(0).expand(bs, -1)
+        position_embeddings = rotary_emb(dummy_input, position_ids=position_ids)
+        model.model.rotary_emb = rotary_emb.cpu()
+        del rotary_emb
+
+        torch.cuda.reset_peak_memory_stats()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Run forward + backward
+        dummy_input.requires_grad_(True)
+        output = block(dummy_input, position_embeddings=position_embeddings)
+        if isinstance(output, tuple):
+            loss = output[0].sum()
+        else:
+            loss = output.sum()
+        loss.backward()
+
+        measured_peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+        del block, dummy_input, output, loss, position_embeddings
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Safety factor check: prediction should be ≥ measured
+        # Allow 5% tolerance for measurement noise
+        if predicted_gb < measured_peak_gb * 0.95:
+            ratio = measured_peak_gb / predicted_gb if predicted_gb > 0 else float('inf')
+            pytest.fail(
+                f"Safety factor inadequate: prediction ({predicted_gb:.3f} GB) is below "
+                f"measured peak ({measured_peak_gb:.3f} GB) by {ratio:.1f}×. "
+                f"The 1.15× safety factor needs to be increased to ~{ratio:.1f}× "
+                f"or the estimator formula needs to account for intermediate tensors."
+            )
+
+    @pytest.mark.cuda
+    def test_breakdown_components_are_positive(self, estimator_prediction):
+        """All breakdown components should be non-negative."""
+        _, breakdown, _ = estimator_prediction
+        for key, value in breakdown.items():
+            assert value >= 0, f"Component '{key}' is negative: {value}"

@@ -28,10 +28,8 @@ class TestCliDataFlow:
 
     def test_auto_tune_called_with_correct_args(self):
         """Verify auto_tune receives expected inputs from args."""
-        # Simulate what __main__.py does
-        available_memory = 128 * 1024 ** 3  # 128 GB
-        memory_utilization = 0.75
-        effective_utilization = memory_utilization  # no margin
+        # Simulate what __main__.py does with --memory-budget 96
+        budget_bytes = 96 * 1024 ** 3  # 96 GiB default budget
 
         user_settings = {
             "batch_size": 8,
@@ -54,11 +52,10 @@ class TestCliDataFlow:
         adjusted, steps = auto_tune(
             user_settings=user_settings,
             model_config=config,
-            available_memory=available_memory,
-            memory_utilization=effective_utilization,
+            budget_bytes=budget_bytes,
         )
 
-        # With 128 GB budget and a 7B model, no adjustments needed
+        # With 96 GB budget and a 7B model, no adjustments needed
         assert len(steps) == 0
         assert adjusted == user_settings
 
@@ -137,11 +134,12 @@ class TestCliDataFlow:
         config.max_position_embeddings = 2048
 
         # Use a tight budget to force adjustments
+        # 32 GiB budget (tight for a 7B model)
+        budget_bytes = 32 * 1024 ** 3
         adjusted, steps = auto_tune(
             user_settings={"batch_size": 8, "seqlen": 2048, "nsamples": 512, "adam": True, "iters": 1000, "group_size": 128},
             model_config=config,
-            available_memory=50 * 1024 ** 3,  # 50 GB - tight
-            memory_utilization=0.65,  # tighter margin from OOM
+            budget_bytes=budget_bytes,
             resume_context=resume_context,
         )
 
@@ -184,12 +182,10 @@ class TestDisplayIntegration:
             steps=[],
             peak_gb=1.2,
             budget_gb=96.0,
-            memory_utilization=0.75,
         )
         assert "Memory OK" in msg
         assert "1.2" in msg
         assert "96.0" in msg
-        assert "75%" in msg
 
     def test_full_preflight_with_adjustment(self):
         """Pre-flight with adjustments shows all fields."""
@@ -203,7 +199,6 @@ class TestDisplayIntegration:
             ],
             peak_gb=58.0,
             budget_gb=96.0,
-            memory_utilization=0.75,
         )
         assert "Memory budget exceeded" in msg
         assert "batch_size" in msg
@@ -226,7 +221,6 @@ class TestDisplayIntegration:
             ],
             peak_gb=35.0,
             budget_gb=83.2,
-            memory_utilization=0.65,
         )
         assert "Resuming from block 9/48" in msg
         assert "OOM'd" in msg
@@ -241,7 +235,6 @@ class TestDisplayIntegration:
             steps=[],
             peak_gb=42.0,
             budget_gb=96.0,
-            memory_utilization=0.75,
         )
         assert "interrupted" in msg
         assert "user stopped" in msg
@@ -256,7 +249,6 @@ class TestDisplayIntegration:
             steps=[],
             peak_gb=25.0,
             budget_gb=83.2,
-            memory_utilization=0.65,
             oom_count=3,
         )
         assert "OOM count: 3" in msg

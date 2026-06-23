@@ -46,7 +46,7 @@ To run comparative benchmarks and compare and contrast quantized models we need 
 
 - **Simple CLI**: Easy-to-use command-line interface i.e. `spark-auto-round <model>`
 - **GB10 Optimized**: Whole-model quantization with 128GB unified memory, or automatic fallback to block-by-block loading for large models that don't fit in memory
-- **Memory-Aware Auto-Tuner**: Pre-flight peak memory estimation automatically adjusts `--batch_size`, `--seqlen`, `--nsamples`, and `--adam` when the per-block peak exceeds available GPU budget. Relaxes the least quality-damaging setting first.
+- **Memory-Aware Auto-Tuner**: Pre-flight peak memory estimation automatically adjusts `--batch_size`, `--seqlen`, and `--nsamples` when the per-block peak exceeds the `--memory_budget` ceiling. Relaxes the least quality-damaging setting first.
 - **Stateful Resume**: If quantization is interrupted (Ctrl-C) or crashes (OOM), re-running the same command resumes from the last completed block. On OOM resume the auto-tuner tightens its budget to avoid re-crashing.
 - **torch.compile**: Always enabled for faster quantization on CUDA
 - **New Datasets** including OpenCode Instruct and updated Github Code Clean
@@ -171,13 +171,19 @@ spark-auto-round <model> [options]
 | `--dataset` | opencode-instruct | Calibration dataset |
 | `--disable_torch_compile` | (disabled) | Disable torch.compile (enabled by default) |
 
+### Memory Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--memory_utilization` | 75 | Percentage of available memory (50–95) used to decide whether to offload blocks to disk. Higher values keep more blocks in GPU memory. |
+| `--memory_budget` | 96 | Per-block memory budget in GiB for the auto-tuner. Sets a hard ceiling on estimated peak memory per block. Default is 75% of 128 GiB. Max: 120. |
+
 ### Tuning Arguments
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--lr` | auto | Learning rate (auto-calculated if not set) |
 | `--minmax_lr` | auto | MinMax learning rate (uses --lr if not set) |
-| `--memory_safety_margin` | 0 | Extra percentage points to tighten memory_utilization (0–20). Useful if a model repeatedly OOMs despite the auto-tuner's adjustments. |
 
 ### Scheme Arguments
 
@@ -193,22 +199,24 @@ spark-auto-round <model> [options]
 |----------|---------|-------------|
 | `--model_dtype` | null | Model dtype for loading |
 | `--seed` | 42 | Random seed |
-| `--adam` | false | Use Adam optimizer (higher quality, higher peak GPU memory) |
 | `--clear-cache` | false | Delete checkpoint cache before starting. Forces a fresh run even if a valid checkpoint exists. |
+| `--dry-run` | false | Run the full init pipeline except quantization tuning; write config files only for inspection. |
+| `--trust-remote-code` | true | Trust remote code when loading models. |
 | `--mllm` | false | Force multimodal mode |
 
 ## Memory and Resume
 
 ### Auto-Tuner
 
-Before quantization begins, the CLI estimates per-block peak GPU memory using your model's configuration and the current settings (`--batch_size`, `--seqlen`, `--nsamples`, `--adam`). If the estimated peak exceeds the available GPU budget (`memory_utilization` × available memory), the auto-tuner relaxes settings in priority order to bring peak below budget:
+Before quantization begins, the CLI estimates per-block peak GPU memory using your model's configuration and the current settings (`--batch_size`, `--seqlen`, `--nsamples`). The estimator accounts for block weights, wrapper parameters, activation outputs, gradient tensors, calibration inputs, attention scores, QKV intermediates, FFN intermediates, and a 1.50× safety factor for CUDA allocator overhead.
+
+If the estimated peak exceeds the `--memory_budget` ceiling (default 96 GiB), the auto-tuner relaxes settings in priority order to bring peak below budget:
 
 | Step | Setting | Relief | Quality Impact |
 |------|---------|--------|----------------|
 | 1 | `--batch_size` 8 → 4 → 2 → 1 | 2× per step | Moderate (noisier gradients) |
 | 2 | `--seqlen` 2048 → 1024 → 512 → 256 | 2× per step | Larger (truncated context) |
 | 3 | `--nsamples` 512 → 256 → 128 | CPU RAM relief | Smaller (less coverage) |
-| 4 | `--adam` enabled → disabled | 2× wrapper params freed | Moderate (SignSGD vs Adam) |
 
 The tuner stops as soon as the budget is satisfied, preserving the highest-quality settings possible. On a fresh run you will see:
 
@@ -251,7 +259,7 @@ The exit reason (`"interrupted"` vs `"oom"`) changes the auto-tuner's behaviour 
 | Previous Exit | Auto-Tuner Behaviour |
 |---------------|----------------------|
 | `interrupted` | Fresh auto-tune with original budget — user chose to stop, settings may be fine |
-| `oom` | Tighter budget (10pp extra margin) and skips one relaxation step — prevents re-crashing on the same settings |
+| `oom` | Skips one relaxation step — prevents re-crashing on the same settings |
 
 On successful completion, `.cache/` is automatically cleaned up. To force a fresh run despite an existing checkpoint, use `--clear-cache`.
 
