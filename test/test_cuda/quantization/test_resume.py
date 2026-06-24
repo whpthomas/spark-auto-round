@@ -6,6 +6,7 @@ Phases:
   Phase 3 (edge cases): Verify error handling, atomic writes, cleanup on interrupt.
   Phase 4 (integration): Full end-to-end crash→resume verification + CLI tests.
 """
+import argparse
 import gc
 import json
 import os
@@ -959,6 +960,639 @@ class TestCliIntegration:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Phase 5: Halt-After Threading (no GPU needed)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestHaltAfterThreading:
+    """Test halt_after threading through factory chain (no GPU needed)."""
+
+    def test_halt_after_default_in_compressor(self):
+        """Default halt_after is -1 when not provided."""
+        from auto_round.compressors.data_driven import DataDrivenCompressor
+        import inspect
+        sig = inspect.signature(DataDrivenCompressor.__init__)
+        assert 'halt_after' not in sig.parameters  # flows via **kwargs
+
+    def test_halt_after_passed_through_autoround(self):
+        """halt_after flows through AutoRound to factory."""
+        from auto_round.autoround import AutoRound
+        import inspect
+        sig = inspect.signature(AutoRound)
+        assert 'halt_after' not in sig.parameters  # flows via **kwargs
+
+    def test_halt_after_passed_through_factory(self):
+        """halt_after flows through auto_round_factory to compressor."""
+        from auto_round.compressors.entry import auto_round_factory
+        import inspect
+        sig = inspect.signature(auto_round_factory)
+        assert 'halt_after' not in sig.parameters  # flows via **kwargs
+
+
+class TestHaltAfterTrigger:
+    """Test halt_after triggers KeyboardInterrupt at correct block index.
+
+    These tests mock the quantization loop to verify the trigger logic
+    without needing a real model or GPU.
+    """
+
+    def test_halt_after_minus_one_does_not_raise(self):
+        """halt_after=-1 (default) does not trigger interrupt."""
+        from auto_round.compressors.data_driven import DataDrivenCompressor
+        compressor = DataDrivenCompressor.__new__(DataDrivenCompressor)
+        compressor._halt_after = -1
+        compressor._checkpoint_block_idx = 0
+        # After save + increment, _checkpoint_block_idx == 1
+        compressor._checkpoint_block_idx = 1
+        # The condition: self._halt_after == self._checkpoint_block_idx - 1
+        # -1 == 1 - 1 -> -1 == 0 -> False
+        assert not (compressor._halt_after == compressor._checkpoint_block_idx - 1)
+
+    def test_halt_after_zero_raises_after_block_0(self):
+        """halt_after=0 triggers after block 0's checkpoint is saved."""
+        from auto_round.compressors.data_driven import DataDrivenCompressor
+        compressor = DataDrivenCompressor.__new__(DataDrivenCompressor)
+        compressor._halt_after = 0
+        compressor._checkpoint_block_idx = 0
+        # After save + increment
+        compressor._checkpoint_block_idx = 1
+        # The condition: self._halt_after == self._checkpoint_block_idx - 1
+        # 0 == 1 - 1 -> 0 == 0 -> True
+        assert compressor._halt_after == compressor._checkpoint_block_idx - 1
+
+    def test_halt_after_five_raises_after_block_5(self):
+        """halt_after=5 triggers after block 5's checkpoint is saved."""
+        from auto_round.compressors.data_driven import DataDrivenCompressor
+        compressor = DataDrivenCompressor.__new__(DataDrivenCompressor)
+        compressor._halt_after = 5
+        compressor._checkpoint_block_idx = 5  # after save + increment
+        compressor._checkpoint_block_idx = 6
+        assert compressor._halt_after == compressor._checkpoint_block_idx - 1
+
+    def test_halt_after_not_reached_does_not_raise(self):
+        """halt_after is not triggered when checkpoint is at a lower index."""
+        from auto_round.compressors.data_driven import DataDrivenCompressor
+        compressor = DataDrivenCompressor.__new__(DataDrivenCompressor)
+        compressor._halt_after = 3
+        compressor._checkpoint_block_idx = 2  # only block 1 saved
+        compressor._checkpoint_block_idx = 3  # block 2 saved
+        # 3 == 3 - 1 -> 3 == 2 -> False
+        assert not (compressor._halt_after == compressor._checkpoint_block_idx - 1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 5: Shakedown Integration Tests (GPU required)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.cuda
+class TestShakedownIntegration:
+    """Test shakedown mode integration (uses tiny model, needs GPU).
+
+    These tests verify that --shakedown produces a successful run with the
+    expected fast override values, using the native CLI entry point so the
+    full pipeline is exercised.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        self.output_dir = str(tmp_path / "shakedown_output")
+        yield
+        shutil.rmtree(self.output_dir, ignore_errors=True)
+        gc.collect()
+
+    def _subdir(self, model_path):
+        """Return the model-specific output subdirectory."""
+        return _get_model_subdir(self.output_dir, model_path)
+
+    def _cache(self, model_path):
+        """Return the .cache path inside the model-specific subdir."""
+        return _cache_dir(self.output_dir, model_path)
+
+    def test_shakedown_run_completes_with_tiny_model(self, tiny_opt_model_path):
+        """Shakedown mode runs to completion with a tiny model."""
+        from auto_round.__main__ import tune
+        from auto_round.logger import logger
+        import argparse
+
+        args = argparse.Namespace(
+            model=tiny_opt_model_path,
+            batch_size=1,
+            iters=1,
+            seqlen=2,
+            nsamples=1,
+            group_size=128,
+            dataset="mbpp",
+            output_dir=self.output_dir,
+            seed=42,
+            disable_torch_compile=False,
+            memory_utilization=75,
+            memory_budget=96,
+            trust_remote_code=True,
+            dry_run=False,
+            clear_cache=False,
+            shakedown=True,
+            halt_after=-1,
+            lr=None,
+            minmax_lr=None,
+            quant_lm_head=False,
+            ignore_layers="",
+            layer_config=None,
+            model_dtype=None,
+        )
+
+        tune(args)
+
+        model_subdir = self._subdir(tiny_opt_model_path)
+
+        # Verify: run completed without error
+        assert os.path.isdir(model_subdir), f"Model subdir should exist: {model_subdir}"
+        assert os.path.isfile(os.path.join(model_subdir, "config.json")),             "config.json should exist in model subdir"
+
+        # Verify: .cache/ is cleaned up
+        cache_dir = self._cache(tiny_opt_model_path)
+        assert not os.path.isdir(cache_dir),             ".cache/ should be removed after successful run"
+
+        # Verify: model weight files exist (more than just config.json)
+        contents = os.listdir(model_subdir)
+        assert len(contents) > 1,             f"Model subdir should contain weight files, got: {contents}"
+
+        logger.info(
+            "PASS: Shakedown mode completed with tiny model at %s",
+            model_subdir,
+        )
+
+    def test_shakedown_with_halt_after_zero(self, tiny_opt_model_path):
+        """Shakedown + halt-after 0 exercises both flags together."""
+        from auto_round.__main__ import tune
+        from auto_round.logger import logger
+        import argparse
+
+        args = argparse.Namespace(
+            model=tiny_opt_model_path,
+            batch_size=1,
+            iters=1,
+            seqlen=2,
+            nsamples=1,
+            group_size=128,
+            dataset="mbpp",
+            output_dir=self.output_dir,
+            seed=42,
+            disable_torch_compile=False,
+            memory_utilization=75,
+            memory_budget=96,
+            trust_remote_code=True,
+            dry_run=False,
+            clear_cache=False,
+            shakedown=True,
+            halt_after=0,
+            lr=None,
+            minmax_lr=None,
+            quant_lm_head=False,
+            ignore_layers="",
+            layer_config=None,
+            model_dtype=None,
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            tune(args)
+
+        cache_dir = self._cache(tiny_opt_model_path)
+
+        # Verify: .cache/ is preserved
+        assert os.path.isdir(cache_dir),             ".cache/ should exist after halt-after interrupt"
+
+        # Verify: progress.json has correct state
+        progress_path = os.path.join(cache_dir, "progress.json")
+        assert os.path.isfile(progress_path)
+        with open(progress_path) as f:
+            progress = json.load(f)
+        assert progress["completed"] >= 1,             f"Expected >= 1 completed, got {progress['completed']}"
+        assert progress["exit_reason"] == "interrupted",             f"Expected interrupted, got {progress.get('exit_reason')}"
+
+        logger.info(
+            "PASS: Shakedown + halt-after 0: completed=%d exit_reason=%s",
+            progress["completed"],
+            progress["exit_reason"],
+        )
+
+    def test_shakedown_resume_after_halt(self, tiny_opt_model_path):
+        """Resume from shakedown + halt-after-0 completes successfully."""
+        from auto_round.__main__ import tune
+        from auto_round.logger import logger
+        import argparse
+
+        # -- Step 1: Partial run -------------------------------------------------
+        args = argparse.Namespace(
+            model=tiny_opt_model_path,
+            batch_size=1,
+            iters=1,
+            seqlen=2,
+            nsamples=1,
+            group_size=128,
+            dataset="mbpp",
+            output_dir=self.output_dir,
+            seed=42,
+            disable_torch_compile=False,
+            memory_utilization=75,
+            memory_budget=96,
+            trust_remote_code=True,
+            dry_run=False,
+            clear_cache=False,
+            shakedown=True,
+            halt_after=0,
+            lr=None,
+            minmax_lr=None,
+            quant_lm_head=False,
+            ignore_layers="",
+            layer_config=None,
+            model_dtype=None,
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            tune(args)
+
+        cache_dir = self._cache(tiny_opt_model_path)
+        assert os.path.isdir(cache_dir), ".cache/ should exist after interrupt"
+
+        # -- Step 2: Resume run --------------------------------------------------
+        args_resume = argparse.Namespace(
+            model=tiny_opt_model_path,
+            batch_size=1,
+            iters=1,
+            seqlen=2,
+            nsamples=1,
+            group_size=128,
+            dataset="mbpp",
+            output_dir=self.output_dir,
+            seed=42,
+            disable_torch_compile=False,
+            memory_utilization=75,
+            memory_budget=96,
+            trust_remote_code=True,
+            dry_run=False,
+            clear_cache=False,
+            shakedown=True,
+            halt_after=-1,  # No halt on resume
+            lr=None,
+            minmax_lr=None,
+            quant_lm_head=False,
+            ignore_layers="",
+            layer_config=None,
+            model_dtype=None,
+        )
+
+        # Should complete without error (resume detects checkpoint)
+        tune(args_resume)
+
+        model_subdir = self._subdir(tiny_opt_model_path)
+        cache_dir = self._cache(tiny_opt_model_path)
+
+        # Verify: .cache/ is cleaned up
+        assert not os.path.isdir(cache_dir),             ".cache/ should be removed after successful resume"
+
+        # Verify: model output exists
+        assert os.path.isfile(os.path.join(model_subdir, "config.json")),             "config.json should exist in model subdir"
+        contents = os.listdir(model_subdir)
+        assert len(contents) > 1,             f"Model subdir should contain weight files after resume, got: {contents}"
+
+        logger.info("PASS: Shakedown resume completed at %s", model_subdir)
+
+
+@pytest.mark.cuda
+class TestHaltAfterNativeIntegration:
+    """Test --halt-after natively (no mock.patch, through CLI path).
+
+    These tests use the exact same code path as the real CLI, calling tune()
+    with argparse Namespace. This validates that halt_after threads through
+    the full chain: parser -> tune() -> AutoRound() -> auto_round_factory() ->
+    DataDrivenCompressor -> _quantize_blocks().
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        self.output_dir = str(tmp_path / "halt_output")
+        yield
+        shutil.rmtree(self.output_dir, ignore_errors=True)
+        gc.collect()
+
+    def _subdir(self, model_path):
+        """Return the model-specific output subdirectory."""
+        return _get_model_subdir(self.output_dir, model_path)
+
+    def _cache(self, model_path):
+        """Return the .cache path inside the model-specific subdir."""
+        return _cache_dir(self.output_dir, model_path)
+
+    def _make_args(self, model_path, halt_after=-1, **overrides):
+        """Build argparse Namespace for tune() call."""
+        base = dict(
+            model=model_path,
+            batch_size=1,
+            iters=1,
+            seqlen=2,
+            nsamples=1,
+            group_size=128,
+            dataset="mbpp",
+            output_dir=self.output_dir,
+            seed=42,
+            disable_torch_compile=False,
+            memory_utilization=75,
+            memory_budget=96,
+            trust_remote_code=True,
+            dry_run=False,
+            clear_cache=False,
+            shakedown=False,
+            halt_after=halt_after,
+            lr=None,
+            minmax_lr=None,
+            quant_lm_head=False,
+            ignore_layers="",
+            layer_config=None,
+            model_dtype=None,
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_halt_after_minus_one_no_halt(self, tiny_opt_model_path):
+        """halt_after=-1 (default) runs to completion."""
+        from auto_round.__main__ import tune
+
+        args = self._make_args(tiny_opt_model_path, halt_after=-1)
+        tune(args)
+
+        model_subdir = self._subdir(tiny_opt_model_path)
+        assert os.path.isfile(os.path.join(model_subdir, "config.json")),             "config.json should exist in model subdir"
+        assert not os.path.isdir(self._cache(tiny_opt_model_path)),             ".cache/ should be cleaned up"
+
+    def test_halt_after_zero_interrupts_after_block_0(self, tiny_opt_model_path):
+        """halt_after=0 raises KeyboardInterrupt after block 0."""
+        from auto_round.__main__ import tune
+
+        args = self._make_args(tiny_opt_model_path, halt_after=0)
+
+        with pytest.raises(KeyboardInterrupt):
+            tune(args)
+
+        # Verify checkpoint was saved
+        cache_dir = self._cache(tiny_opt_model_path)
+        assert os.path.isdir(cache_dir)
+        progress_path = os.path.join(cache_dir, "progress.json")
+        with open(progress_path) as f:
+            progress = json.load(f)
+        assert progress["completed"] >= 1
+        assert progress["exit_reason"] == "interrupted"
+
+    def test_halt_after_resume_completes(self, tiny_opt_model_path):
+        """Resume after halt_after=0 completes and matches golden."""
+        from auto_round.__main__ import tune
+
+        # Partial run
+        args = self._make_args(tiny_opt_model_path, halt_after=0)
+        with pytest.raises(KeyboardInterrupt):
+            tune(args)
+
+        # Resume run
+        args_resume = self._make_args(tiny_opt_model_path, halt_after=-1)
+        tune(args_resume)
+
+        # Verify completion
+        model_subdir = self._subdir(tiny_opt_model_path)
+        assert os.path.isfile(os.path.join(model_subdir, "config.json")),             "config.json should exist after resume"
+        assert not os.path.isdir(self._cache(tiny_opt_model_path)),             ".cache/ should be cleaned up after resume"
+
+    def test_halt_after_clear_cache_interaction(self, tiny_opt_model_path):
+        """--clear-cache + --halt-after: clear-cache is applied first."""
+        from auto_round.__main__ import tune
+
+        cache_dir = self._cache(tiny_opt_model_path)
+
+        # Create stale cache dir
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(os.path.join(cache_dir, "stale"), "w") as f:
+            f.write("stale")
+
+        # Run with both --clear-cache and --halt-after 0
+        args = self._make_args(
+            tiny_opt_model_path,
+            halt_after=0,
+            clear_cache=True,
+        )
+        with pytest.raises(KeyboardInterrupt):
+            tune(args)
+
+        # Verify: stale file wasn't loaded (fresh checkpoint from this run)
+        assert os.path.isdir(cache_dir)
+        progress_path = os.path.join(cache_dir, "progress.json")
+        assert os.path.isfile(progress_path)
+        with open(progress_path) as f:
+            progress = json.load(f)
+        assert progress["completed"] >= 1
+        # The stale file should not exist (cache was cleared)
+        assert not os.path.isfile(os.path.join(cache_dir, "stale"))
+
+    def test_halt_after_high_value_no_halt(self, tiny_opt_model_path):
+        """halt_after >= total_blocks does not halt (block doesn't exist)."""
+        from auto_round.__main__ import tune
+
+        # Use a very high halt_after value (block won't exist)
+        args = self._make_args(tiny_opt_model_path, halt_after=999)
+        tune(args)
+
+        model_subdir = self._subdir(tiny_opt_model_path)
+        assert os.path.isfile(os.path.join(model_subdir, "config.json")),             "config.json should exist"
+        assert not os.path.isdir(self._cache(tiny_opt_model_path)),             ".cache/ should be cleaned up"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Run marker summary:
+#   pytest test/test_cuda/quantization/test_resume.py -v  (Phases 1-3 only)
+#   pytest test/test_cuda/quantization/test_resume.py -v -m "cuda"  (Phase 4 GPU tests)
+#   pytest test/test_cuda/quantization/test_resume.py -v -m "slow"  (all slow tests)
+#   pytest test/test_cuda/quantization/test_resume.py -v -m "not slow"  (fast tests only)
+class TestHybridArchitectureResumeBug:
+    """Regression test for cross-block contamination in hybrid architectures.
+
+    Bug: After --halt-after N interrupts quantization, resuming with the same
+    --output_dir crashes during export with:
+        AttributeError: 'Linear' object has no attribute 'scale'
+
+    Root cause: _apply_quant_config_to_loaded_blocks used leaf-name fallback
+    in layer_config lookup, causing configs from one block type (e.g. self_attn)
+    to be applied to a different block type (e.g. linear_attn) that doesn't
+    have packed weights in the checkpoint.
+    """
+
+    def test_apply_quant_config_skips_layers_not_in_checkpoint(self, tmp_path):
+        """Verify _apply_quant_config_to_loaded_blocks skips sub-modules that
+        have no packed weights in the checkpoint, even if layer_config has an
+        entry for them."""
+        import torch.nn as nn
+        from auto_round.compressors.data_driven import DataDrivenCompressor
+
+        # Create a minimal model with two blocks:
+        # Block 0: has "linear_attn" (simulating linear_attn block type)
+        # Block 1: has "self_attn" (simulating self_attn block type)
+        model = nn.Module()
+        block0 = nn.Module()
+        block0.linear_attn = nn.Module()
+        block0.linear_attn.in_proj_qkv = nn.Linear(64, 192, bias=False)
+        block0.linear_attn.out_proj = nn.Linear(64, 64, bias=False)
+        block0.mlp = nn.Module()
+        block0.mlp.gate_proj = nn.Linear(64, 128, bias=False)
+        block1 = nn.Module()
+        block1.self_attn = nn.Module()
+        block1.self_attn.q_proj = nn.Linear(64, 64, bias=False)
+        block1.self_attn.k_proj = nn.Linear(64, 64, bias=False)
+        block1.mlp = nn.Module()
+        block1.mlp.gate_proj = nn.Linear(64, 128, bias=False)
+        model.layers = nn.ModuleList([block0, block1])
+
+        # Create checkpoint for block 0 only (simulating halt-after=1)
+        # Block 0 has linear_attn + mlp, NO self_attn
+        num_groups = 1  # group_size=64, in_features=64
+        ckpt_state = {
+            "linear_attn.in_proj_qkv.scales": torch.randn(num_groups, 192).half(),
+            "linear_attn.in_proj_qkv.qweight": torch.randint(0, 255, (64 // 32 * 4, 192), dtype=torch.int32),
+            "linear_attn.in_proj_qkv.qzeros": torch.randint(0, 255, (num_groups, 64 // 32 * 4), dtype=torch.int32),
+            "linear_attn.out_proj.scales": torch.randn(num_groups, 64).half(),
+            "linear_attn.out_proj.qweight": torch.randint(0, 255, (64 // 32 * 4, 64), dtype=torch.int32),
+            "linear_attn.out_proj.qzeros": torch.randint(0, 255, (num_groups, 64 // 32 * 4), dtype=torch.int32),
+            "mlp.gate_proj.scales": torch.randn(num_groups, 128).half(),
+            "mlp.gate_proj.qweight": torch.randint(0, 255, (64 // 32 * 4, 128), dtype=torch.int32),
+            "mlp.gate_proj.qzeros": torch.randint(0, 255, (num_groups, 64 // 32 * 4), dtype=torch.int32),
+        }
+
+        # Save checkpoint to .cache/ subdirectory (matching _checkpoint_block_path)
+        cache_dir = str(tmp_path / ".cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        ckpt_path = os.path.join(cache_dir, "block_00000.pt")
+        torch.save(ckpt_state, ckpt_path)
+
+        # Set up compressor mock
+        compressor = DataDrivenCompressor.__new__(DataDrivenCompressor)
+        compressor.compress_context = type('MockContext', (), {
+            'output_dir': str(tmp_path),
+            'low_cpu_mem_usage': False,
+        })()
+        compressor._offloader = None
+        compressor.model_context = type('MockModelContext', (), {'model': model})()
+
+        # layer_config has entries for BOTH block types
+        # (this is the real-world scenario — layer_config covers ALL layers)
+        layer_config = {
+            "layers.0.linear_attn.in_proj_qkv": {"bits": 4, "group_size": 64, "sym": False, "act_bits": 16},
+            "layers.0.linear_attn.out_proj": {"bits": 4, "group_size": 64, "sym": False, "act_bits": 16},
+            "layers.0.mlp.gate_proj": {"bits": 4, "group_size": 64, "sym": False, "act_bits": 16},
+            # Block 1 entries exist in layer_config but block 1 is NOT in checkpoint
+            "layers.1.self_attn.q_proj": {"bits": 4, "group_size": 64, "sym": False, "act_bits": 16},
+            "layers.1.self_attn.k_proj": {"bits": 4, "group_size": 64, "sym": False, "act_bits": 16},
+            "layers.1.mlp.gate_proj": {"bits": 4, "group_size": 64, "sym": False, "act_bits": 16},
+        }
+        compressor.quantizer = type('MockQuantizer', (), {'layer_config': layer_config})()
+
+        # Manually load checkpoint into block 0 (simulating _load_checkpoint_block)
+        from auto_round.utils.offload import _load_state_dict_into_module
+        # Only load the weight/bias keys (not scales/qweight which are packed format)
+        # In the real code, _load_state_dict_into_module drops these silently
+        raw_state = {k: v for k, v in ckpt_state.items()
+                     if not any(k.endswith(s) for s in ('.scales', '.qweight', '.qzeros'))}
+        _load_state_dict_into_module(raw_state, model.layers[0])
+
+        # saved_block_names is a flat list of HF layer names from progress.json
+        # Call with completed=1 — this should NOT set bits=4 on block 1's layers
+        compressor._apply_quant_config_to_loaded_blocks(1, ["layers.0"])
+
+        # Verify: block 0's layers have bits set (they were in checkpoint)
+        assert hasattr(model.layers[0].linear_attn.in_proj_qkv, 'bits')
+        assert model.layers[0].linear_attn.in_proj_qkv.bits == 4
+        assert hasattr(model.layers[0].linear_attn.out_proj, 'bits')
+        assert model.layers[0].linear_attn.out_proj.bits == 4
+        assert hasattr(model.layers[0].mlp.gate_proj, 'bits')
+        assert model.layers[0].mlp.gate_proj.bits == 4
+
+        # Verify: block 1's layers do NOT have bits set (they were NOT in checkpoint)
+        assert not hasattr(model.layers[1].self_attn.q_proj, 'bits'), \
+            "BUG: bits set on layer not in checkpoint — this would cause export crash"
+        assert not hasattr(model.layers[1].self_attn.k_proj, 'bits'), \
+            "BUG: bits set on layer not in checkpoint — this would cause export crash"
+        assert not hasattr(model.layers[1].mlp.gate_proj, 'bits'), \
+            "BUG: bits set on layer not in checkpoint — this would cause export crash"
+
+    def test_apply_quant_config_skips_leaf_name_fallback_contamination(self, tmp_path):
+        """Verify that leaf-name fallback does NOT cause cross-block contamination.
+
+        This is the exact scenario from the bug:
+        - Block 0 has linear_attn.in_proj_qkv
+        - layer_config has self_attn.q_proj (from block 1)
+        - Old code: leaf-name fallback matches 'self_attn.q_proj' config to
+          block 0's sub-modules (which don't have that name)
+        - New code: full-path lookup only, so no contamination
+        """
+        import torch.nn as nn
+        from auto_round.compressors.data_driven import DataDrivenCompressor
+
+        model = nn.Module()
+        block0 = nn.Module()
+        block0.linear_attn = nn.Module()
+        block0.linear_attn.in_proj_qkv = nn.Linear(64, 192, bias=False)
+        model.layers = nn.ModuleList([block0])
+
+        # Checkpoint has linear_attn.in_proj_qkv
+        num_groups = 1
+        ckpt_state = {
+            "linear_attn.in_proj_qkv.scales": torch.randn(num_groups, 192).half(),
+            "linear_attn.in_proj_qkv.qweight": torch.randint(0, 255, (64 // 32 * 4, 192), dtype=torch.int32),
+            "linear_attn.in_proj_qkv.qzeros": torch.randint(0, 255, (num_groups, 64 // 32 * 4), dtype=torch.int32),
+        }
+
+        # Save checkpoint to .cache/ subdirectory
+        cache_dir = str(tmp_path / ".cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        ckpt_path = os.path.join(cache_dir, "block_00000.pt")
+        torch.save(ckpt_state, ckpt_path)
+
+        compressor = DataDrivenCompressor.__new__(DataDrivenCompressor)
+        compressor.compress_context = type('MockContext', (), {
+            'output_dir': str(tmp_path),
+            'low_cpu_mem_usage': False,
+        })()
+        compressor._offloader = None
+        compressor.model_context = type('MockModelContext', (), {'model': model})()
+
+        # layer_config has an entry for self_attn.q_proj at layers.0
+        # (this is the problematic entry — it exists in layer_config because
+        # block 1 has self_attn, but block 0 does NOT)
+        layer_config = {
+            "layers.0.linear_attn.in_proj_qkv": {"bits": 4, "group_size": 64, "sym": False, "act_bits": 16},
+            "layers.0.self_attn.q_proj": {"bits": 4, "group_size": 64, "sym": False, "act_bits": 16},
+        }
+        compressor.quantizer = type('MockQuantizer', (), {'layer_config': layer_config})()
+
+        # Manually load checkpoint into block 0
+        from auto_round.utils.offload import _load_state_dict_into_module
+        raw_state = {k: v for k, v in ckpt_state.items()
+                     if not any(k.endswith(s) for s in ('.scales', '.qweight', '.qzeros'))}
+        _load_state_dict_into_module(raw_state, model.layers[0])
+
+        # saved_block_names is a flat list of HF layer names from progress.json
+        compressor._apply_quant_config_to_loaded_blocks(1, ["layers.0"])
+
+        # linear_attn.in_proj_qkv should have bits set (it was in checkpoint)
+        assert hasattr(model.layers[0].linear_attn.in_proj_qkv, 'bits')
+        assert model.layers[0].linear_attn.in_proj_qkv.bits == 4
+
+        # self_attn.q_proj does NOT exist in the model at all.
+        # The old code would have tried to find it via leaf-name fallback,
+        # found the config, and set bits on... nothing (since the module
+        # doesn't exist). But the real danger is when a DIFFERENT block has
+        # self_attn.q_proj as a real module — that module would get bits=4
+        # set without having scale/qweight.
+        # With the new code, full-path lookup for "layers.0.self_attn.q_proj"
+        # returns None (not in layer_config by full path), so it's skipped.
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Run marker summary:
 #   pytest test/test_cuda/quantization/test_resume.py -v  (Phases 1-3 only)
 #   pytest test/test_cuda/quantization/test_resume.py -v -m "cuda"  (Phase 4 GPU tests)

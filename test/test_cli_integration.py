@@ -46,3 +46,73 @@ class TestMetricsWiring:
         from auto_round.compressors import data_driven
         assert hasattr(data_driven, 'compute_block_sensitivity') or \
                'compute_block_sensitivity' in dir(data_driven)
+
+
+class TestShakedownCli:
+    """Test that --shakedown flag is parsed correctly."""
+
+    def test_shakedown_default_false(self):
+        """--shakedown defaults to False."""
+        from auto_round.__main__ import BasicArgumentParser
+        parser = BasicArgumentParser()
+        args = parser.parse_args(["Qwen/Qwen3.5-0.8B"])
+        assert args.shakedown is False
+
+    def test_shakedown_flag_true(self):
+        """--shakedown sets flag to True."""
+        from auto_round.__main__ import BasicArgumentParser
+        parser = BasicArgumentParser()
+        args = parser.parse_args(["Qwen/Qwen3.5-0.8B", "--shakedown"])
+        assert args.shakedown is True
+
+    def test_shakedown_does_not_affect_other_args(self):
+        """--shakedown does not change other argument defaults."""
+        from auto_round.__main__ import BasicArgumentParser
+        parser = BasicArgumentParser()
+        args = parser.parse_args(["Qwen/Qwen3.5-0.8B", "--shakedown"])
+        assert args.iters == 1000  # default, overridden later
+        assert args.nsamples == 512
+        assert args.seqlen == 2048
+        assert args.batch_size == 8
+
+
+class TestHaltAfterCli:
+    """Test that --halt-after flag is parsed correctly."""
+
+    def test_halt_after_default_minus_one(self):
+        """--halt-after defaults to -1 (no halt)."""
+        from auto_round.__main__ import BasicArgumentParser
+        parser = BasicArgumentParser()
+        args = parser.parse_args(["Qwen/Qwen3.5-0.8B"])
+        assert args.halt_after == -1
+
+    def test_halt_after_zero(self):
+        """--halt-after 0 is parsed correctly."""
+        from auto_round.__main__ import BasicArgumentParser
+        parser = BasicArgumentParser()
+        args = parser.parse_args(["Qwen/Qwen3.5-0.8B", "--halt-after", "0"])
+        assert args.halt_after == 0
+
+    def test_halt_after_positive_int(self):
+        """--halt-after 5 is parsed correctly."""
+        from auto_round.__main__ import BasicArgumentParser
+        parser = BasicArgumentParser()
+        args = parser.parse_args(["Qwen/Qwen3.5-0.8B", "--halt-after", "5"])
+        assert args.halt_after == 5
+
+    def test_halt_after_negative_one(self):
+        """--halt-after -1 is parsed correctly (no halt)."""
+        from auto_round.__main__ import BasicArgumentParser
+        parser = BasicArgumentParser()
+        args = parser.parse_args(["Qwen/Qwen3.5-0.8B", "--halt-after", "-1"])
+        assert args.halt_after == -1
+
+    def test_halt_after_with_shakedown(self):
+        """--shakedown and --halt-after can be used together."""
+        from auto_round.__main__ import BasicArgumentParser
+        parser = BasicArgumentParser()
+        args = parser.parse_args(
+            ["Qwen/Qwen3.5-0.8B", "--shakedown", "--halt-after", "2"]
+        )
+        assert args.shakedown is True
+        assert args.halt_after == 2

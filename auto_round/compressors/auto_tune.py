@@ -32,7 +32,11 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict, List, Optional, Tuple
 
-from auto_round.compressors.memory_estimator import estimate_peak_memory_per_block
+from auto_round.utils.device.memory_estimator import (
+    _get_block_params,
+    _get_hidden_dimensions,
+    estimate_peak_memory_per_block,
+)
 
 # ---------------------------------------------------------------------------
 # Relaxation priority ladder
@@ -143,9 +147,17 @@ def auto_tune(
             "skipped": True,  # marker for display
         })
 
+    # Pre-compute hidden dimensions and per-block param count (pure functions
+    # of model_config — same for every iteration of the relaxation loop).
+    dims = _get_hidden_dimensions(model_config)
+    per_block_params = _get_block_params(model_config, dims)
+
     # Now the main relaxation loop
     while True:
-        peak_gb, _ = estimate_peak_memory_per_block(model_config, adjusted)
+        peak_gb, _ = estimate_peak_memory_per_block(
+            model_config, adjusted,
+            hidden_dims=dims, block_params=per_block_params,
+        )
         peak_bytes = int(peak_gb * (1024 ** 3))
 
         if peak_bytes <= budget_bytes:

@@ -90,7 +90,7 @@ def tiny_gemma_model_path():
 def tiny_qwen_model_path():
     model_name_or_path = qwen_name_or_path
     tiny_model_path = "./tmp/tiny_qwen_model_path"
-    tiny_model_path = save_tiny_model(model_name_or_path, tiny_model_path)
+    tiny_model_path = save_tiny_model(model_name_or_path, tiny_model_path, from_config=True)
     yield tiny_model_path
     shutil.rmtree(tiny_model_path, ignore_errors=True)
 

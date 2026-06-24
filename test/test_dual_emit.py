@@ -41,7 +41,7 @@ def _run_tune_with_patches(capsys, extra_patches=None):
             {"batch_size": 4, "seqlen": 1024},
             [{"setting": "batch_size", "old": 8, "new": 4, "impact": "noisier gradients"}],
         )),
-        "auto_round.compressors.memory_estimator.estimate_peak_memory_per_block": MagicMock(
+        "auto_round.utils.device.memory_estimator.estimate_peak_memory_per_block": MagicMock(
             return_value=(32.0, None)
         ),
         "auto_round.AutoRound": MagicMock(),

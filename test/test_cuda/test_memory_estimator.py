@@ -11,14 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for auto_round.compressors.memory_estimator."""
+"""Tests for auto_round.utils.device.memory_estimator."""
 
 import gc
 import math
 import pytest
 import torch
 
-from auto_round.compressors.memory_estimator import (
+from auto_round.utils.device.memory_estimator import (
     estimate_peak_memory_per_block,
     _get_block_params,
     _get_hidden_dimensions,

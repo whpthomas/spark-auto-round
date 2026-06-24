@@ -97,6 +97,8 @@ class DataDrivenCompressor(BaseCompressor):
     ):
         self.iters = iters
         self.clear_cache = kwargs.pop("clear_cache", False)
+        self._halt_after = kwargs.pop("halt_after", -1)
+        self._shakedown = kwargs.pop("shakedown", False)
         self._checkpoint_block_idx = 0
         self._exit_reason: Optional[str] = None
         self._tuning_profile = tuning_profile
@@ -614,20 +616,20 @@ class DataDrivenCompressor(BaseCompressor):
                     for name in names:
                         self._offloader(model, name, overwrite=True)
 
-            # ── Checkpoint: save quantized state after each block ──────────
-            if nblocks == 1:
-                self._save_checkpoint(self._checkpoint_block_idx, block_name_or_names, m)
-                self._checkpoint_block_idx += 1
-            else:
-                logger.debug(
-                    f"Skipping checkpoint for block_idx={self._checkpoint_block_idx}: "
-                    f"nblocks={nblocks} > 1 not supported for checkpointing"
-                )
-
-            # ── Sensitivity metrics ───────────────────────────────────────────
+            # ── Sensitivity metrics (computed before checkpoint to ensure
+            #    data is saved even if halt-after fires after this block) ──
+            sensitivity_saved = False
             if q_input is not None and hasattr(self, '_display') and self._display is not None:
                 cos_sim, psnr_db = compute_block_sensitivity(reference_output, q_input)
                 block_label = n if nblocks == 1 else f"[{i+1}-{min(i+nblocks, len(block_names))}]/{len(block_names)}"
+                sens_metrics = {
+                    "cosine_sim": cos_sim,
+                    "psnr_db": psnr_db,
+                    "init_loss": _tune_result.get("init_loss"),
+                    "best_loss": _tune_result.get("best_loss"),
+                    "best_iter": _tune_result.get("best_iter", 0),
+                    "total_iters": _tune_result.get("total_iters", 0),
+                }
                 self._display.print_sensitivity(
                     block_label, cos_sim, psnr_db,
                     init_loss=_tune_result.get("init_loss"),
@@ -643,6 +645,27 @@ class DataDrivenCompressor(BaseCompressor):
                         best_iter=_tune_result.get("best_iter", 0),
                         total_iters=_tune_result.get("total_iters", 0),
                     )
+                # Persist sensitivity to disk so it survives halt-after / crash
+                if nblocks == 1:
+                    self._save_sensitivity(self._checkpoint_block_idx, block_name_or_names, sens_metrics)
+                    sensitivity_saved = True
+
+            # ── Checkpoint: save quantized state after each block ──────────
+            if nblocks == 1:
+                self._save_checkpoint(self._checkpoint_block_idx, block_name_or_names, m)
+                self._checkpoint_block_idx += 1
+                # ── HALT-AFTER: simulate interrupt after N-th block ────────
+                if self._halt_after == self._checkpoint_block_idx - 1:
+                    logger.warning(
+                        "HALT-AFTER: simulating interrupt after block %d",
+                        self._checkpoint_block_idx - 1,
+                    )
+                    raise KeyboardInterrupt("--halt-after block %d" % (self._checkpoint_block_idx - 1))
+            else:
+                logger.debug(
+                    f"Skipping checkpoint for block_idx={self._checkpoint_block_idx}: "
+                    f"nblocks={nblocks} > 1 not supported for checkpointing"
+                )
 
 
         if not self.compress_context.is_immediate_saving:
@@ -819,7 +842,80 @@ class DataDrivenCompressor(BaseCompressor):
         logger.debug(f"Checkpoint saved: {block_path}")
 
         # Update progress.json
-        self._save_checkpoint_progress(block_idx)
+        self._save_checkpoint_progress(block_idx + 1)
+
+    def _save_sensitivity(self, block_idx: int, block_name: str, metrics: dict) -> None:
+        """Save sensitivity metrics for a block to .cache/sensitivity.json.
+
+        Args:
+            block_idx: Zero-based block index.
+            block_name: Block name (e.g. 'model.layers.0').
+            metrics: Dict with keys: cosine_sim, psnr_db, init_loss, best_loss,
+                     best_iter, total_iters.
+        """
+        ckpt_dir = self._checkpoint_dir
+        if ckpt_dir is None:
+            return
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        sens_path = os.path.join(ckpt_dir, "sensitivity.json")
+        # Load existing or start fresh
+        if os.path.isfile(sens_path):
+            try:
+                with open(sens_path, "r") as f:
+                    sensitivity_data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                sensitivity_data = {}
+        else:
+            sensitivity_data = {}
+
+        key = f"block_{block_idx:05d}"
+        sensitivity_data[key] = {
+            "block_name": block_name,
+            "cosine_sim": metrics.get("cosine_sim", 1.0),
+            "psnr_db": metrics.get("psnr_db", float("inf")),
+            "init_loss": metrics.get("init_loss"),
+            "best_loss": metrics.get("best_loss"),
+            "best_iter": metrics.get("best_iter", 0),
+            "total_iters": metrics.get("total_iters", 0),
+        }
+
+        # Atomic write
+        tmp_path = sens_path + ".tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(sensitivity_data, f, indent=2)
+            os.replace(tmp_path, sens_path)
+        except OSError:
+            pass  # best-effort
+
+    def _load_sensitivity(self) -> dict:
+        """Load sensitivity metrics from .cache/sensitivity.json.
+
+        Returns:
+            Dict mapping block_idx (int) to sensitivity metrics dict,
+            or empty dict if no sensitivity data exists.
+        """
+        ckpt_dir = self._checkpoint_dir
+        if ckpt_dir is None:
+            return {}
+        sens_path = os.path.join(ckpt_dir, "sensitivity.json")
+        if not os.path.isfile(sens_path):
+            return {}
+        try:
+            with open(sens_path, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+        # Convert string keys back to int indices
+        result = {}
+        for key, metrics in data.items():
+            try:
+                idx = int(key.split("_")[1])
+                result[idx] = metrics
+            except (IndexError, ValueError):
+                continue
+        return result
 
     def _save_checkpoint_progress(self, completed: int) -> None:
         """Write or update progress.json with the number of completed blocks."""
@@ -842,10 +938,15 @@ class DataDrivenCompressor(BaseCompressor):
         except (AttributeError, RuntimeError):
             pass
 
+        # Flatten block names to get the true count of individual blocks.
+        # For MLLM models, quant_block_list is [["layer.0", ..., "layer.23"]]
+        # (one group).  flatten_list produces 24 individual entries.
+        flat_block_names = flatten_list(all_block_names) if all_block_names else []
+
         progress = {
             "completed": completed,
-            "total": len(all_block_names),
-            "block_names": [b[0] if isinstance(b, list) else b for b in all_block_names],
+            "total": len(flat_block_names),
+            "block_names": [b[0] if isinstance(b, list) else b for b in flat_block_names],
             "exit_reason": self._exit_reason,
             "tuning_profile": self._tuning_profile,
         }
@@ -978,6 +1079,126 @@ class DataDrivenCompressor(BaseCompressor):
             del state_dict
             gc.collect()
 
+    def _apply_quant_config_to_loaded_blocks(self, completed: int, saved_block_names: list) -> None:
+        """Apply quantization config attributes to modules loaded from checkpoint.
+
+        When blocks are loaded from checkpoint into raw nn.Linear modules, the
+        quantization attributes (bits, group_size, sym, act_bits, scale, zp)
+        are not set.  This method reads them from self.quantizer.layer_config
+        and applies them so that pack_layer() can access them during export.
+
+        CRITICAL: Uses saved_block_names (one per checkpoint) to load the
+        correct checkpoint for each HF layer.  Previously this iterated
+        all_blocks entries which caused cross-layer contamination when a
+        single block entry contained multiple HF layers (VLM case).
+
+        Args:
+            completed: Number of HF layers loaded from checkpoint.
+            saved_block_names: List of HF layer names from progress.json,
+                one per checkpoint block (e.g. ["model.language_model.layers.0",
+                "model.language_model.layers.1", ...]).
+        """
+        if not hasattr(self, 'quantizer') or self.quantizer is None:
+            return
+        layer_config = self.quantizer.layer_config
+        if layer_config is None:
+            return
+
+        from auto_round.utils.model.utils import get_module, check_to_quantized
+
+        # Iterate over each completed checkpoint, using saved_block_names
+        # to get the correct HF layer name and checkpoint index.
+        for i in range(completed):
+            if i >= len(saved_block_names):
+                break
+            block_name = saved_block_names[i]
+
+            try:
+                block_module = get_module(self.model_context.model, block_name)
+            except (AttributeError, KeyError):
+                continue
+            if block_module is None:
+                continue
+
+            # Load the correct checkpoint for this specific HF layer
+            ckpt_state = None
+            try:
+                ckpt_path = self._checkpoint_block_path(i)
+                if os.path.isfile(ckpt_path):
+                    ckpt_state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+            except Exception:
+                pass
+
+            # Iterate over sub-modules in the block
+            for name, submod in block_module.named_modules():
+                # Build the full layer name relative to the model
+                full_name = f"{block_name}.{name}" if name else block_name
+
+                # Look up config by full path ONLY — no leaf-name fallback.
+                config = layer_config.get(full_name)
+                if config is None:
+                    continue
+                # Skip non-quantized layers
+                try:
+                    if not check_to_quantized(config):
+                        continue
+                except Exception:
+                    continue
+
+                # Get bits, group_size, sym, act_bits from config
+                if isinstance(config, dict):
+                    bits = config.get("bits", 4)
+                    group_size = config.get("group_size", 128)
+                    sym = config.get("sym", False)
+                    act_bits = config.get("act_bits", 16)
+                else:
+                    bits = getattr(config, "bits", 4)
+                    group_size = getattr(config, "group_size", 128)
+                    sym = getattr(config, "sym", False)
+                    act_bits = getattr(config, "act_bits", 16)
+
+                # Verify that this sub-module actually has packed weights in the
+                # checkpoint before setting quant attributes.
+                has_packed_in_ckpt = False
+                if ckpt_state is not None:
+                    prefix = f"{name}." if name else ""
+                    for ckpt_key in ckpt_state:
+                        if ckpt_key.startswith(prefix):
+                            suffix = ckpt_key[len(prefix):]
+                            if suffix in ("scales", "qweight", "qzeros"):
+                                has_packed_in_ckpt = True
+                                break
+
+                if not has_packed_in_ckpt:
+                    continue
+
+                # Set quantization config attributes on the module
+                submod.bits = bits
+                submod.group_size = group_size
+                submod.sym = sym
+                submod.act_bits = act_bits
+
+                # Load scale, zp, and packed weight from the checkpoint state dict.
+                if ckpt_state is not None:
+                    prefix = f"{name}." if name else ""
+                    for ckpt_key, ckpt_val in ckpt_state.items():
+                        if ckpt_key.startswith(prefix):
+                            suffix = ckpt_key[len(prefix):]
+                            if suffix == "scales" and not hasattr(submod, "scale"):
+                                # Store scales in checkpoint format (num_groups, out_features).
+                                # pack_layer's has_packed_weights branch will transpose
+                                # when copying to QuantLinear (matching pack_248_bits).
+                                submod.scale = ckpt_val.contiguous().half()
+                            elif suffix == "qzeros" and not hasattr(submod, "zp"):
+                                # Store qzeros in checkpoint format (num_groups, packed_out_features)
+                                submod.zp = ckpt_val.contiguous()
+                            elif suffix == "qweight" and not hasattr(submod, "qweight"):
+                                # Store packed weight on the module for pack_layer()
+                                submod.qweight = ckpt_val
+
+            if ckpt_state is not None:
+                del ckpt_state
+
     def _clear_cache(self) -> None:
         """Remove the .cache checkpoint directory if it exists.
 
@@ -1034,6 +1255,9 @@ class DataDrivenCompressor(BaseCompressor):
         The quantized model and layer configurations.
         """
         self.post_init()
+
+        # Handle --clear-cache flag: remove existing checkpoints before starting
+        self._check_and_clear_cache_flag()
 
         # Reclaim heap fragmentation from init/post_init before the memory-intensive quantize loop.
         gc.collect()
@@ -1127,6 +1351,7 @@ class DataDrivenCompressor(BaseCompressor):
 
         # ── Resume mode: load completed blocks into model ───────────────────
         if resume_mode and completed > 0:
+            saved_sensitivity = self._load_sensitivity()
             logger.info("Loading %d completed blocks from checkpoint...", completed)
             for i in range(completed):
                 block_name = saved_block_names[i] if i < len(saved_block_names) else None
@@ -1140,12 +1365,41 @@ class DataDrivenCompressor(BaseCompressor):
                     logger.warning(
                         "Cannot resolve block name for index %d, skipping checkpoint load", i
                     )
+                # ── Display sensitivity for this resumed block ──────────────
+                # Gives the user immediate feedback on the quality of each
+                # already-quantized block, same as during a fresh run.
+                if block_name and i in saved_sensitivity:
+                    sm = saved_sensitivity[i]
+                    self._report.add_layer(
+                        block_name,
+                        sm["cosine_sim"],
+                        sm["psnr_db"],
+                        init_loss=sm.get("init_loss"),
+                        best_loss=sm.get("best_loss"),
+                        best_iter=sm.get("best_iter", 0),
+                        total_iters=sm.get("total_iters", 0),
+                    )
+                    self._display.print_sensitivity(
+                        block_name,
+                        sm["cosine_sim"],
+                        sm["psnr_db"],
+                        init_loss=sm.get("init_loss"),
+                        best_loss=sm.get("best_loss"),
+                        best_iter=sm.get("best_iter", 0),
+                        total_iters=sm.get("total_iters", 0),
+                    )
             logger.info("Completed block loading. Resuming from block %d.", completed)
+
+            # ── Apply quantization config to loaded modules so export works ──
+            self._apply_quant_config_to_loaded_blocks(completed, saved_block_names)
         elif not resume_mode:
             logger.info("Fresh quantization run: no existing checkpoint found.")
 
         # ── All blocks already completed? Skip quantization loop ────────────
-        all_done = resume_mode and completed >= len(all_blocks)
+        # Use total_blocks (sum of all HF layers) not len(all_blocks) (number
+        # of block entries). For VLMs, a single block entry may contain many
+        # HF layers — comparing against len(all_blocks) would skip too early.
+        all_done = resume_mode and completed >= total_blocks
         if all_done:
             logger.info(
                 "All %d blocks already completed in checkpoint. "
@@ -1158,15 +1412,41 @@ class DataDrivenCompressor(BaseCompressor):
             for block_names in all_blocks:
                 if all_done:
                     break
-                # In resume mode, skip blocks up to completed count
+                # In resume mode, skip completed HF layers within this block entry.
+                # A single block entry may contain multiple HF layers (VLM case),
+                # so we must skip per-layer, not per-entry.
                 if resume_mode and self._checkpoint_block_idx < completed:
-                    logger.info(f"Skipping already-completed block {self._checkpoint_block_idx}: {block_names}")
-                    inputs = all_inputs[block_names[0]]
-                    all_inputs.pop(block_names[0])
-                    if all_q_inputs is not None:
-                        all_q_inputs.pop(block_names[0], None)
-                    self._checkpoint_block_idx += len(block_names)
-                    continue
+                    layers_to_skip = min(
+                        len(block_names),
+                        completed - self._checkpoint_block_idx,
+                    )
+                    if layers_to_skip == len(block_names):
+                        # Skip entire entry — pop the cache entry keyed by first block name
+                        logger.info(f"Skipping already-completed block {self._checkpoint_block_idx}: {block_names}")
+                        first_name = block_names[0]
+                        if first_name in all_inputs:
+                            all_inputs.pop(first_name)
+                        if all_q_inputs is not None and first_name in all_q_inputs:
+                            all_q_inputs.pop(first_name)
+                        self._checkpoint_block_idx += len(block_names)
+                        continue
+                    else:
+                        # Partially skip: some layers done, some need quantizing.
+                        # Re-key all_inputs from the original first element to the
+                        # new first element so the normal input-fetch path works.
+                        logger.info(
+                            "Skipping %d of %d completed layers in %s",
+                            layers_to_skip, len(block_names), block_names[0],
+                        )
+                        old_first = block_names[0]
+                        new_first = block_names[layers_to_skip]
+                        self._checkpoint_block_idx += layers_to_skip
+                        block_names = block_names[layers_to_skip:]
+                        # Move inputs from old key to new key
+                        if old_first in all_inputs:
+                            all_inputs[new_first] = all_inputs.pop(old_first)
+                        if all_q_inputs is not None and old_first in all_q_inputs:
+                            all_q_inputs[new_first] = all_q_inputs.pop(old_first)
 
                 inputs = all_inputs[block_names[0]]
                 all_inputs.pop(block_names[0])
@@ -1294,7 +1574,8 @@ class DataDrivenCompressor(BaseCompressor):
             # Success: write exit_reason before clearing cache
             self._write_exit_reason("completed")
             # No exception: clean up .cache/ on successful completion
-            if self.compress_context.output_dir:
+            # In shakedown mode, preserve .cache/ for debugging inspection
+            if self.compress_context.output_dir and not self._shakedown:
                 self._clear_cache()
                 logger.info("Checkpoint cache cleaned up after successful quantization.")
 

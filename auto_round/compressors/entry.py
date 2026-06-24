@@ -212,7 +212,11 @@ def auto_round_factory(
             if _k in kwargs:
                 mllm_kwargs[_k] = kwargs.pop(_k)
 
-    return compressor_cls(alg_configs, **local_args, **mllm_kwargs, **kwargs)
+    # Preserve halt_after and shakedown for the compressor
+    halt_after = kwargs.pop("halt_after", -1)
+    shakedown = kwargs.pop("shakedown", False)
+
+    return compressor_cls(alg_configs, **local_args, **mllm_kwargs, halt_after=halt_after, shakedown=shakedown, **kwargs)
 
 
 def _pop_config_kwargs(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:

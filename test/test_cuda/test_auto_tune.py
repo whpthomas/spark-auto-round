@@ -118,7 +118,7 @@ class TestAutoTuneFresh:
 
     def test_batch_size_relaxed_once(self, medium_config):
         """Moderate pressure — batch_size reduces one step (8→4)."""
-        from auto_round.compressors.memory_estimator import (
+        from auto_round.utils.device.memory_estimator import (
             estimate_peak_memory_per_block,
         )
         peak_bs8, _ = estimate_peak_memory_per_block(medium_config, {
@@ -146,7 +146,7 @@ class TestAutoTuneFresh:
 
     def test_multiple_relaxations(self, medium_config):
         """Sequential relaxations across different settings."""
-        from auto_round.compressors.memory_estimator import (
+        from auto_round.utils.device.memory_estimator import (
             estimate_peak_memory_per_block,
         )
 
@@ -187,7 +187,7 @@ class TestAutoTuneFresh:
 
     def test_never_touches_iters_or_group_size(self, medium_config):
         """Auto-tuner must not modify iters or group_size under any budget."""
-        from auto_round.compressors.memory_estimator import (
+        from auto_round.utils.device.memory_estimator import (
             estimate_peak_memory_per_block,
         )
 
@@ -210,7 +210,7 @@ class TestAutoTuneFresh:
 
     def test_nonstandard_initial_values(self, medium_config):
         """User starts with batch_size=2 — tuner starts from that level."""
-        from auto_round.compressors.memory_estimator import (
+        from auto_round.utils.device.memory_estimator import (
             estimate_peak_memory_per_block,
         )
 
@@ -235,7 +235,7 @@ class TestAutoTuneFresh:
 
     def test_different_budget_levels(self, medium_config):
         """Lower budget should trigger stricter relaxations."""
-        from auto_round.compressors.memory_estimator import (
+        from auto_round.utils.device.memory_estimator import (
             estimate_peak_memory_per_block,
         )
 
@@ -280,7 +280,7 @@ class TestAutoTuneFresh:
 class TestAutoTuneResume:
     def test_resume_after_interrupt_fresh_start(self, medium_config):
         """Interrupted run — no skip, fresh auto-tune."""
-        from auto_round.compressors.memory_estimator import (
+        from auto_round.utils.device.memory_estimator import (
             estimate_peak_memory_per_block,
         )
 
@@ -309,7 +309,7 @@ class TestAutoTuneResume:
 
     def test_resume_after_oom_skip_one_level(self, medium_config):
         """OOM resume — skip one level (start from next relaxation step)."""
-        from auto_round.compressors.memory_estimator import (
+        from auto_round.utils.device.memory_estimator import (
             estimate_peak_memory_per_block,
         )
 
@@ -338,7 +338,7 @@ class TestAutoTuneResume:
 
     def test_resume_after_multiple_ooms(self, medium_config):
         """2+ OOMs — skip 2 steps (accelerate through broken configs)."""
-        from auto_round.compressors.memory_estimator import (
+        from auto_round.utils.device.memory_estimator import (
             estimate_peak_memory_per_block,
         )
 
@@ -358,7 +358,7 @@ class TestAutoTuneResume:
 
     def test_resume_no_context(self, medium_config):
         """No resume context — fresh start (same as auto_tune without ctx)."""
-        from auto_round.compressors.memory_estimator import (
+        from auto_round.utils.device.memory_estimator import (
             estimate_peak_memory_per_block,
         )
 
@@ -656,7 +656,7 @@ class TestMemoryBudget:
     def test_budget_bytes_is_direct_ceiling(self, small_config):
         """budget_bytes is used directly — no multiplication."""
         # If budget is exactly peak, it should fit (peak <= budget)
-        from auto_round.compressors.memory_estimator import (
+        from auto_round.utils.device.memory_estimator import (
             estimate_peak_memory_per_block,
         )
         # Use same settings as the auto_tune call

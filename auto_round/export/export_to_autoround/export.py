@@ -198,21 +198,44 @@ def pack_layer(layer_name, model, backend, device=None):
     qlayer = new_layer
     import auto_round_extension.torch.qlinear_torch
 
-    if (
-        sym
-        and isinstance(zp, torch.Tensor)
-        and isinstance(QuantLinear, (auto_round_extension.torch.qlinear_torch.QuantLinear))
-    ):
-        zp = int(zp.flatten()[0])
+    # Check if the raw Linear already has packed quantized weights loaded from a
+    # checkpoint (qweight, scale, zp attributes set by _apply_quant_config_to_loaded_blocks).
+    # This happens during resume: _load_checkpoint_block() loads the state dict into
+    # a raw Linear, and _apply_quant_config_to_loaded_blocks() adds the attributes.
+    # In this case, skip re-packing (which would fail because scale/zp are in packed
+    # format) and load the packed state directly into the QuantLinear.
+    has_packed_weights = (
+        hasattr(layer, 'qweight')
+        and hasattr(layer, 'scale')
+        and hasattr(layer, 'zp')
+    )
 
-    qlayer.to("cpu")
-    # Force to float32 to be compatible with torch 2.0
-    sig = inspect.signature(qlayer.pack)
-    param_count = len(sig.parameters)
-    if param_count == 2:
-        qlayer.pack(layer, scale, device=device)
+    if has_packed_weights:
+        # Load the already-packed state directly into the QuantLinear.
+        # layer.scale and layer.zp are in checkpoint format (num_groups, out_features)
+        # set by _apply_quant_config_to_loaded_blocks.  Copy as-is to match the
+        # fresh-quantization output shape.
+        qlayer.qweight = layer.qweight
+        qlayer.scales = layer.scale.clone() if isinstance(layer.scale, torch.Tensor) else layer.scale
+        qlayer.qzeros = layer.zp.clone() if isinstance(layer.zp, torch.Tensor) else layer.zp
+        if bias and layer.bias is not None:
+            qlayer.bias = layer.bias.clone().half()
     else:
-        qlayer.pack(layer, scale, zp, None, device=device)
+        if (
+            sym
+            and isinstance(zp, torch.Tensor)
+            and isinstance(QuantLinear, (auto_round_extension.torch.qlinear_torch.QuantLinear))
+        ):
+            zp = int(zp.flatten()[0])
+
+        qlayer.to("cpu")
+        # Force to float32 to be compatible with torch 2.0
+        sig = inspect.signature(qlayer.pack)
+        param_count = len(sig.parameters)
+        if param_count == 2:
+            qlayer.pack(layer, scale, device=device)
+        else:
+            qlayer.pack(layer, scale, zp, None, device=device)
     qlayer.to(orig_device)
 
     # Inject rotation buffers right after packing so that

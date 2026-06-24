@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     )
     from auto_round.compressors.data_driven import DataDrivenCompressor
     from auto_round.compressors.entry import AutoRoundCompatible, AutoRound
-    from auto_round.compressors.memory_estimator import estimate_peak_memory_per_block
+    from auto_round.utils.device.memory_estimator import estimate_peak_memory_per_block
     from auto_round.compressors.auto_tune import (
         auto_tune,
         format_preflight_message,
@@ -81,7 +81,7 @@ def __getattr__(name):
             "SchemeExtraConfig": SchemeExtraConfig,
         }[name]
     elif name == "estimate_peak_memory_per_block":
-        from auto_round.compressors.memory_estimator import estimate_peak_memory_per_block
+        from auto_round.utils.device.memory_estimator import estimate_peak_memory_per_block
 
         return estimate_peak_memory_per_block
     elif name == "auto_tune":

@@ -279,7 +279,14 @@ def estimate_memory_strategy(
 
     try:
         from transformers import AutoConfig
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        # If model_path is a local directory, use local_files_only=True
+        # to avoid huggingface_hub repo_id validation on absolute paths
+        if os.path.isdir(model_path):
+            config = AutoConfig.from_pretrained(
+                model_path, trust_remote_code=True, local_files_only=True
+            )
+        else:
+            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     except Exception as e:
         raise ValueError(
             f"Cannot load config for {model_path}: {e}. "
@@ -298,7 +305,12 @@ def estimate_memory_strategy(
     model_bytes = num_params * dtype_bytes
 
     if torch.cuda.is_available():
-        available_bytes = torch.cuda.mem_get_info(0)[0]
+        # Use total - allocated instead of mem_get_info to include reclaimable
+        # cache.  mem_get_info only reports truly free memory and ignores the
+        # CUDA allocator's cached blocks that can be reclaimed.
+        total_mem = torch.cuda.get_device_properties(0).total_memory
+        allocated_mem = torch.cuda.memory_allocated(0)
+        available_bytes = total_mem - allocated_mem
     else:
         available_bytes = 0
 
@@ -323,31 +335,32 @@ def estimate_memory_strategy(
     return use_offload, info
 
 
-def log_memory_analysis(info: dict, memory_utilization: float = 0.75) -> None:
+def log_memory_analysis(info: dict, memory_utilization: float = 0.75, budget_gb: float = 96.0) -> None:
     """Log comprehensive memory analysis at INFO level."""
     model_gb = info["model_bytes"] / (1024 ** 3)
     avail_gb = info["available_bytes"] / (1024 ** 3)
-    thresh_gb = info["threshold_bytes"] / (1024 ** 3)
     block_mb = info["block_size_bytes"] / (1024 ** 2)
     num_params_b = info["num_params"] / 1e9
 
-    threshold_pct = int(memory_utilization * 100)
+    total_gpu_gb = 0.0
+    if torch.cuda.is_available():
+        total_gpu_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
 
     logger.info(
         "Memory analysis:\n"
         "  Model:          %s\n"
         "  Parameters:     %.1fB\n"
         "  Model size:     %.1f GB (%s)\n"
-        "  Available:      %.1f GB\n"
-        "  Threshold:      %.1f GB (%d%%)\n"
+        "  GPU:            %.1f GB total, %.1f GB available\n"
+        "  Budget:         %.1f GiB (auto-tuner per-block ceiling)\n"
         "  Strategy:       %s%s\n"
         "  Blocks:         %d layers\n"
         "  Block size:     ~%.0f MB each",
         info["model_name"],
         num_params_b,
         model_gb, info["dtype"],
-        avail_gb,
-        thresh_gb, threshold_pct,
+        total_gpu_gb, avail_gb,
+        budget_gb,
         info["strategy"],
         " (model exceeds threshold)" if info["strategy"] == "block-offload"
             else " (fits in memory)",

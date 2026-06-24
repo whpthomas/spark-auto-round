@@ -46,6 +46,10 @@ __all__ = [
     "log_memory_analysis",
     "memory_monitor",
     "out_of_vram",
+    # memory_estimator.py
+    "_get_block_params",
+    "_get_hidden_dimensions",
+    "estimate_peak_memory_per_block",
     # patches.py
     "_bump_dynamo_cache_limit",
     "_allocate_layers_to_devices",
@@ -103,6 +107,13 @@ from auto_round.utils.device.memory import (
     log_memory_analysis,
     memory_monitor,
     out_of_vram,
+)
+
+# Re-export from memory_estimator.py
+from auto_round.utils.device.memory_estimator import (
+    _get_block_params,
+    _get_hidden_dimensions,
+    estimate_peak_memory_per_block,
 )
 
 # Re-export from patches.py

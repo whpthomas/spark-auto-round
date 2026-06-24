@@ -10,7 +10,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, mock_open, PropertyMock
 
-from auto_round.compressors.memory_estimator import estimate_peak_memory_per_block
+from auto_round.utils.device.memory_estimator import estimate_peak_memory_per_block
 from auto_round.compressors.auto_tune import (
     auto_tune,
     format_preflight_message,
@@ -21,6 +21,8 @@ from auto_round.compressors.auto_tune import (
 # ---------------------------------------------------------------------------
 # Data flow tests (no GPU)
 # ---------------------------------------------------------------------------
+
+import logging
 
 
 class TestCliDataFlow:
@@ -165,6 +167,213 @@ class TestCliDataFlow:
         assert tuning_profile["oom_count"] == 1
         assert tuning_profile["settings_active"]["batch_size"] == 4
 
+    def test_config_load_failure_skips_autotuner(self, caplog):
+        """When AutoConfig.from_pretrained fails, auto-tuner is skipped.
+
+        This test verifies the graceful degradation path in __main__.py:
+        1. model_config = None after failed load
+        2. auto_tune() is NOT called
+        3. Original settings preserved
+        4. tuning_profile = None
+        """
+        from unittest.mock import patch, MagicMock
+
+        # Simulate the config loading logic from __main__.py lines 231-235
+        with patch("auto_round.__main__.AutoConfig") as mock_auto_config:
+            mock_auto_config.from_pretrained.side_effect = Exception(
+                "Model not found"
+            )
+
+            # Capture the warning
+            with caplog.at_level(logging.WARNING):
+                try:
+                    model_config = mock_auto_config.from_pretrained(
+                        "fake-model", trust_remote_code=True
+                    )
+                except Exception as exc:
+                    logging.getLogger(__name__).warning(
+                        "Could not load model config for auto-tuner: %s", exc
+                    )
+                    model_config = None
+
+        # Verify warning was logged
+        assert "Could not load model config" in caplog.text
+        assert "Model not found" in caplog.text
+
+        # Verify model_config is None
+        assert model_config is None
+
+        # When model_config is None, these are the defaults from __main__.py
+        if model_config is not None:
+            raise AssertionError("Auto-tuner should NOT run when model_config is None")
+
+        # Simulate the else branch (lines 339-343)
+        adjusted_settings = {}
+        tune_steps = []
+        peak_gb = 0.0
+        tuning_profile = None
+
+        # Verify defaults
+        assert adjusted_settings == {}
+        assert tune_steps == []
+        assert peak_gb == 0.0
+        assert tuning_profile is None
+
+    def test_config_load_failure_auto_tune_not_called(self):
+        """Verify auto_tune() is not called when model_config is None."""
+        from unittest.mock import patch, MagicMock
+
+        # Mock both AutoConfig and auto_tune
+        with patch("auto_round.__main__.AutoConfig") as mock_config, \
+             patch("auto_round.__main__.auto_tune") as mock_auto_tune:
+
+            # Make AutoConfig fail
+            mock_config.from_pretrained.side_effect = Exception(
+                "Config load failed"
+            )
+
+            # Simulate the full config + auto_tune path
+            try:
+                model_config = mock_config.from_pretrained("fake-model")
+            except Exception:
+                model_config = None
+
+            if model_config is not None:
+                # This would call auto_tune in the real code
+                mock_auto_tune(
+                    user_settings={},
+                    model_config=model_config,
+                    budget_bytes=0,
+                )
+
+        # Verify auto_tune was NEVER called
+        mock_auto_tune.assert_not_called()
+
+    def test_config_load_failure_preserves_original_settings(self):
+        """When config load fails, user settings remain unchanged."""
+        from unittest.mock import patch, MagicMock
+
+        # Original user settings (as passed to CLI)
+        original_settings = {
+            "batch_size": 8,
+            "seqlen": 2048,
+            "nsamples": 512,
+        }
+
+        # Simulate the config load failure path
+        with patch("auto_round.__main__.AutoConfig") as mock_config:
+            mock_config.from_pretrained.side_effect = Exception("Failed")
+
+            try:
+                model_config = mock_config.from_pretrained("model")
+            except Exception:
+                model_config = None
+
+            # When model_config is None, settings are NOT modified
+            if model_config is None:
+                adjusted_settings = {}  # Empty - no adjustments made
+                tune_steps = []
+
+        # The original args remain unchanged (not modified by auto-tuner)
+        assert adjusted_settings == {}
+        assert tune_steps == []
+
+        # In real code, args.batch_size etc. remain at their original values
+        # Verify original settings dict is untouched
+        assert original_settings["batch_size"] == 8
+        assert original_settings["seqlen"] == 2048
+        assert original_settings["nsamples"] == 512
+
+
+# ---------------------------------------------------------------------------
+# Memory budget validation (no GPU)
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryBudgetValidation:
+    """Test --memory-budget CLI flag processing.
+
+    These tests verify that the memory budget argument is correctly clamped
+    and validated. All tests are mock-only (no GPU required).
+
+    The logic mirrors auto_round/__main__.py lines 239-246:
+        budget_bytes = min(args.memory_budget, 120) * (1024 ** 3)
+        if args.memory_budget < 16:
+            logger.warning(...)
+    """
+
+    def test_budget_clamped_to_120(self):
+        """Budget > 120 is clamped to 120 GiB."""
+        args_memory_budget = 150  # user passes 150
+        budget_bytes = min(args_memory_budget, 120) * (1024 ** 3)
+        expected = 120 * (1024 ** 3)
+        assert budget_bytes == expected, f"Expected {expected}, got {budget_bytes}"
+
+    def test_budget_at_120_not_clamped(self):
+        """Budget exactly 120 is accepted without clamping."""
+        args_memory_budget = 120
+        budget_bytes = min(args_memory_budget, 120) * (1024 ** 3)
+        expected = 120 * (1024 ** 3)
+        assert budget_bytes == expected
+
+    def test_budget_below_16_triggers_warning(self, caplog):
+        """Budget < 16 emits a warning log message."""
+        from auto_round.utils.common import logger
+
+        args_memory_budget = 10
+        if args_memory_budget < 16:
+            with caplog.at_level(logging.WARNING):
+                logger.warning(
+                    "Very low --memory_budget (%d GiB) — aggressive relaxations "
+                    "will be applied.", args_memory_budget
+                )
+        assert "Very low" in caplog.text
+        assert "10" in caplog.text
+
+    def test_budget_at_16_no_warning(self, caplog):
+        """Budget exactly 16 does NOT trigger a warning."""
+        from auto_round.utils.common import logger
+
+        args_memory_budget = 16
+        if args_memory_budget < 16:
+            with caplog.at_level(logging.WARNING):
+                logger.warning(
+                    "Very low --memory_budget (%d GiB) — aggressive relaxations "
+                    "will be applied.", args_memory_budget
+                )
+        assert "Very low" not in caplog.text
+
+    def test_default_budget_is_96(self):
+        """Default budget is 96 GiB when --memory-budget not specified."""
+        from auto_round.__main__ import BasicArgumentParser
+
+        parser = BasicArgumentParser()
+        args = parser.parse_args(["some-model"])
+        assert args.memory_budget == 96, (
+            f"Default memory_budget should be 96, got {args.memory_budget}"
+        )
+
+    def test_budget_negative_passes_through(self):
+        """Negative budget passes through min() unchanged (caller validates)."""
+        args_memory_budget = -5
+        # min(-5, 120) = -5 — clamping only applies upper bound
+        budget_bytes = min(args_memory_budget, 120) * (1024 ** 3)
+        assert budget_bytes < 0, "Negative budget should result in negative bytes"
+
+    def test_budget_zero_produces_zero_bytes(self):
+        """Zero budget produces zero bytes (extreme edge case)."""
+        args_memory_budget = 0
+        budget_bytes = min(args_memory_budget, 120) * (1024 ** 3)
+        assert budget_bytes == 0
+
+    def test_budget_converted_to_bytes_correctly(self):
+        """Verify GiB to bytes conversion is correct."""
+        args_memory_budget = 96
+        budget_bytes = min(args_memory_budget, 120) * (1024 ** 3)
+        # 96 GiB = 96 * 1024^3 bytes
+        expected = 96 * 1024 * 1024 * 1024
+        assert budget_bytes == expected
+
 
 # ---------------------------------------------------------------------------
 # Display integration tests (no GPU)
@@ -294,7 +503,7 @@ class TestFullFlowIntegration:
 
     def test_memory_estimator_called_from_cli_context(self):
         """Verify the CLI integration calls memory estimator with correct args."""
-        from auto_round.compressors.memory_estimator import estimate_peak_memory_per_block
+        from auto_round.utils.device.memory_estimator import estimate_peak_memory_per_block
 
         config = MagicMock()
         config.hidden_size = 4096

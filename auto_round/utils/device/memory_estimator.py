@@ -18,7 +18,7 @@ block's forward/backward/optimize cycle. Used by the auto-tuner (auto_tune.py)
 to detect memory pressure before a run begins.
 
 Usage:
-    from auto_round.compressors.memory_estimator import estimate_peak_memory_per_block
+    from auto_round.utils.device.memory_estimator import estimate_peak_memory_per_block
 
     peak_gb, breakdown = estimate_peak_memory_per_block(config, {
         "batch_size": 8, "seqlen": 2048,
@@ -38,6 +38,8 @@ from typing import Any, Dict, Tuple
 def estimate_peak_memory_per_block(
     config: "AutoConfig",  # noqa: F821 — HuggingFace AutoConfig
     user_settings: Dict[str, Any],
+    hidden_dims: Dict[str, Any] | None = None,
+    block_params: int | None = None,
 ) -> Tuple[float, Dict[str, float]]:
     """Compute peak GPU memory (GB) for a single quantization block.
 
@@ -52,11 +54,17 @@ def estimate_peak_memory_per_block(
         Optionally:
             nsamples : int      (informational; does not affect GPU peak)
             group_size : int    (default 128)
+    hidden_dims : dict or None
+        Pre-computed hidden dimensions (from _get_hidden_dimensions).
+        If None, computed from config.
+    block_params : int or None
+        Pre-computed per-block parameter count (from _get_block_params).
+        If None, computed from config.
 
     Returns
     -------
     peak_gb : float
-        Estimated peak GPU memory in gibibytes (GiB), including 1.15× safety.
+        Estimated peak GPU memory in gibibytes (GiB), including 1.50× safety.
     breakdown : dict
         Per-component sizes in GiB for debugging.
 
@@ -71,21 +79,27 @@ def estimate_peak_memory_per_block(
     seqlen = user_settings["seqlen"]
 
     # -- Extract model dimensions -------------------------------------------
-    dims = _get_hidden_dimensions(config)
+    if hidden_dims is not None:
+        dims = hidden_dims
+    else:
+        dims = _get_hidden_dimensions(config)
     hidden = dims["hidden_size"]
     num_layers = dims["num_layers"]  # noqa: F841 — available for future use
 
-    block_params = _get_block_params(config, dims)
+    if block_params is not None:
+        per_block_params = block_params
+    else:
+        per_block_params = _get_block_params(config, dims)
 
     # -- Component sizes in bytes -------------------------------------------
     # Each weight is stored as bf16 (2 bytes)
-    block_weight_bytes = block_params * 2
+    block_weight_bytes = per_block_params * 2
 
     # Wrapper duplicates params as fp32 (4 bytes) — value + min_scale + max_scale
     # value (round) has same element count as weights
     # min_scale / max_scale: hidden × ceil(hidden / group_size) each — negligible
     # Conservative: block_params × 4 for value, plus small overhead for scales
-    wrapper_value_bytes = block_params * 4
+    wrapper_value_bytes = per_block_params * 4
     # Scale params: ~2 × hidden × ceil(hidden / 128) × 4 — typically << 1% of weights
     group_size = user_settings.get("group_size", 128)
     scale_params_per_scale = hidden * math.ceil(hidden / group_size)

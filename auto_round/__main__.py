@@ -116,6 +116,22 @@ class BasicArgumentParser(argparse.ArgumentParser):
             help="Delete checkpoint cache (.cache/) before starting quantization. "
                  "Use this to force a fresh run if the existing checkpoint is stale or corrupt.",
         )
+        basic.add_argument(
+            "--shakedown",
+            action="store_true",
+            default=False,
+            help="Run in shakedown mode: override iters=1, nsamples=1, seqlen=2, "
+                 "batch_size=1 for fastest possible end-to-end test. "
+                 "Quantized model will be of very low quality.",
+        )
+        basic.add_argument(
+            "--halt-after",
+            type=int,
+            default=-1,
+            help="Simulate a KeyboardInterrupt after saving the N-th block's "
+                 "checkpoint. -1 (default) means no halt. Use 0 to halt after "
+                 "the first block. Works with or without --shakedown.",
+        )
 
         tuning = self.add_argument_group("Tuning Arguments")
         tuning.add_argument(
@@ -216,7 +232,7 @@ def tune(args):
     use_offload, memory_info = estimate_memory_strategy(
         model_name, memory_utilization=memory_utilization
     )
-    log_memory_analysis(memory_info, memory_utilization)
+    log_memory_analysis(memory_info, memory_utilization, budget_gb=float(args.memory_budget))
 
     # If model exceeds memory threshold, load on meta device (zero memory)
     # and load blocks on demand during quantization.
@@ -288,9 +304,16 @@ def tune(args):
         )
 
         # Compute peak for display
-        from auto_round.compressors.memory_estimator import estimate_peak_memory_per_block
+        from auto_round.utils.device.memory_estimator import (
+            _get_block_params,
+            _get_hidden_dimensions,
+            estimate_peak_memory_per_block,
+        )
+        _cached_dims = _get_hidden_dimensions(model_config)
+        _cached_params = _get_block_params(model_config, _cached_dims)
         peak_gb, _ = estimate_peak_memory_per_block(
             model_config, adjusted_settings,
+            hidden_dims=_cached_dims, block_params=_cached_params,
         )
 
         # Display message
@@ -340,6 +363,38 @@ def tune(args):
         tune_steps = []
         peak_gb = 0.0
         tuning_profile = None
+
+    # ── Shakedown mode overrides ──────────────────────────────────────────
+    if args.shakedown:
+        args.iters = 1
+        args.nsamples = 1
+        args.seqlen = 2
+        args.batch_size = 1
+        # Also ensure auto_tuner adjusted_settings reflect these values
+        adjusted_settings = {"batch_size": 1, "seqlen": 2, "nsamples": 1}
+        tuning_profile = {
+            "relaxation_step": 0,
+            "oom_count": 0,
+            "settings_active": {
+                "batch_size": 1,
+                "seqlen": 2,
+                "nsamples": 1,
+            },
+        }
+        # Print prominent banner
+        import textwrap
+        banner = textwrap.dedent("""\
+        \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
+        \u2551  SHAKEDOWN MODE \u2014 fastest/lowest quality settings    \u2551
+        \u2551  iters=1  nsamples=1  seqlen=2  batch_size=1         \u2551
+        \u2551  NOT suitable for production quantization             \u2551
+        \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d
+        """)
+        print(banner)
+        logger.warning(
+            "SHAKEDOWN MODE: iters=1 nsamples=1 seqlen=2 batch_size=1 "
+            " \u2014 NOT suitable for production quantization"
+        )
 
     from auto_round import AutoRound
 
@@ -412,6 +467,8 @@ def tune(args):
         use_meta_device=use_meta_device,
         tuning_profile=tuning_profile,
         auto_tuner_steps=tune_steps,
+        halt_after=args.halt_after,
+        shakedown=args.shakedown,
     )
 
     # Reset exit_reason for fresh start (state initialization, not duck-typing)
