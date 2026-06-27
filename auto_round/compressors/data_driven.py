@@ -912,8 +912,8 @@ class DataDrivenCompressor(BaseCompressor):
             with open(tmp_path, "w") as f:
                 json.dump(sensitivity_data, f, indent=2)
             os.replace(tmp_path, sens_path)
-        except OSError:
-            pass  # best-effort
+        except OSError as exc:
+            logger.warning("Failed to save sensitivity for block %d (%s): %s", block_idx, block_name, exc)
 
     def _load_sensitivity(self) -> dict:
         """Load sensitivity metrics from .cache/sensitivity.json.
@@ -1025,10 +1025,18 @@ class DataDrivenCompressor(BaseCompressor):
             with open(tmp_path, "w") as f:
                 json.dump(progress, f, indent=2)
             os.replace(tmp_path, progress_path)
-        except OSError:
-            pass  # best-effort
+        except OSError as exc:
+            logger.warning("Failed to write exit_reason to %s: %s", progress_path, exc)
+            # Clean up temp file if rename failed
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
-    def _load_checkpoint_block(self, block_idx: int, block_name: str, model: torch.nn.Module) -> None:
+    def _load_checkpoint_block(
+        self, block_idx: int, block_name: str, model: torch.nn.Module
+    ) -> Optional[dict]:
         """Load a checkpointed block state dict into the model.
 
         Handles both regular and meta-device modules:
@@ -1039,90 +1047,91 @@ class DataDrivenCompressor(BaseCompressor):
             block_idx: Zero-based block index
             block_name: Name of the block module (e.g. "model.layers.0")
             model: The full model (module hierarchy)
+
+        Returns:
+            The checkpoint state dict (on CPU) if loaded successfully, or None
+            if the checkpoint could not be loaded.  The caller is responsible
+            for deleting the returned dict when done to free CPU memory.
         """
         ckpt_dir = self._checkpoint_dir
         if ckpt_dir is None:
             logger.warning("Cannot load checkpoint block %d: no checkpoint directory", block_idx)
-            return
+            return None
 
         try:
             block_path = self._checkpoint_block_path(block_idx)
         except ValueError:
             logger.warning("Cannot load checkpoint block %d: output_dir not set", block_idx)
-            return
+            return None
 
         if not os.path.isfile(block_path):
             logger.warning("Checkpoint file not found: %s", block_path)
-            return
+            return None
 
         # Load state dict from disk
         state_dict = torch.load(block_path, map_location="cpu", weights_only=True)
 
-        try:
-            # Get the module
-            from auto_round.utils.model import get_module
-            module = get_module(model, block_name)
-            if module is None:
-                logger.warning("Cannot find module %s in model, skipping checkpoint load", block_name)
-                return
-
-            # Check if module is on meta device
-            is_meta = False
-            for p in module.parameters():
-                if p.device.type == "meta":
-                    is_meta = True
-                    break
-            if not is_meta:
-                for b in module.buffers():
-                    if b.device.type == "meta":
-                        is_meta = True
-                        break
-
-            if is_meta:
-                # Materialize from meta: create real tensors, then load state dict
-                logger.debug("Materializing meta-device module %s for checkpoint load", block_name)
-
-                materialize_model_(module)
-                # Move to CPU for state dict loading
-                module = module.to("cpu")
-                # Load state dict using the offload helper
-                from auto_round.utils.offload import _load_state_dict_into_module
-
-                _load_state_dict_into_module(state_dict, module)
-
-                # Re-offload if low_cpu_mem_usage is active
-                if self.compress_context and self.compress_context.low_cpu_mem_usage and self._offloader is not None:
-                    self._offloader(model, block_name, overwrite=True)
-            else:
-                # Module is already materialized — load state dict directly on CPU
-                from auto_round.utils.offload import _load_state_dict_into_module
-
-                _load_state_dict_into_module(state_dict, module)
-
-            logger.debug("Loaded checkpoint block %d (%s) from %s", block_idx, block_name, block_path)
-        finally:
-            # Free CPU memory from loaded state dict
+        # Get the module — done outside the inner try so exceptions propagate
+        from auto_round.utils.model import get_module
+        module = get_module(model, block_name)
+        if module is None:
+            logger.warning("Cannot find module %s in model, skipping checkpoint load", block_name)
             del state_dict
             gc.collect()
+            return None
 
-    def _apply_quant_config_to_loaded_blocks(self, completed: int, saved_block_names: list) -> None:
-        """Apply quantization config attributes to modules loaded from checkpoint.
+        # Check if module is on meta device
+        is_meta = False
+        for p in module.parameters():
+            if p.device.type == "meta":
+                is_meta = True
+                break
+        if not is_meta:
+            for b in module.buffers():
+                if b.device.type == "meta":
+                    is_meta = True
+                    break
 
-        When blocks are loaded from checkpoint into raw nn.Linear modules, the
-        quantization attributes (bits, group_size, sym, act_bits, scale, zp)
-        are not set.  This method reads them from self.quantizer.layer_config
-        and applies them so that pack_layer() can access them during export.
+        if is_meta:
+            # Materialize from meta: create real tensors, then load state dict
+            logger.debug("Materializing meta-device module %s for checkpoint load", block_name)
 
-        CRITICAL: Uses saved_block_names (one per checkpoint) to load the
-        correct checkpoint for each HF layer.  Previously this iterated
-        all_blocks entries which caused cross-layer contamination when a
-        single block entry contained multiple HF layers (VLM case).
+            materialize_model_(module)
+            # Move to CPU for state dict loading
+            module = module.to("cpu")
+            # Load state dict using the offload helper
+            from auto_round.utils.offload import _load_state_dict_into_module
+
+            _load_state_dict_into_module(state_dict, module)
+
+            # Re-offload if low_cpu_mem_usage is active
+            if self.compress_context and self.compress_context.low_cpu_mem_usage and self._offloader is not None:
+                self._offloader(model, block_name, overwrite=True)
+        else:
+            # Module is already materialized — load state dict directly on CPU
+            from auto_round.utils.offload import _load_state_dict_into_module
+
+            _load_state_dict_into_module(state_dict, module)
+
+        logger.debug("Loaded checkpoint block %d (%s) from %s", block_idx, block_name, block_path)
+        # Return the state dict so the caller can use it for quant config
+        # without reloading from disk.  Caller must delete when done.
+        return state_dict
+
+    def _apply_quant_config_to_loaded_block(
+        self, block_idx: int, block_name: str, ckpt_state: Optional[dict]
+    ) -> None:
+        """Apply quantization config attributes to a single loaded block.
+
+        Sets bits/group_size/sym/act_bits and loads scale/qweight/qzeros
+        from *ckpt_state* onto sub-modules so pack_layer() can access them
+        during export.  The caller owns *ckpt_state* and must delete it when
+        done to free CPU memory.
 
         Args:
-            completed: Number of HF layers loaded from checkpoint.
-            saved_block_names: List of HF layer names from progress.json,
-                one per checkpoint block (e.g. ["model.language_model.layers.0",
-                "model.language_model.layers.1", ...]).
+            block_idx: Zero-based block index (for logging).
+            block_name: Block name (e.g. "model.layers.0").
+            ckpt_state: Checkpoint state dict for this block, or None.
         """
         if not hasattr(self, 'quantizer') or self.quantizer is None:
             return
@@ -1132,98 +1141,84 @@ class DataDrivenCompressor(BaseCompressor):
 
         from auto_round.utils.model.utils import get_module, check_to_quantized
 
-        # Iterate over each completed checkpoint, using saved_block_names
-        # to get the correct HF layer name and checkpoint index.
-        for i in range(completed):
-            if i >= len(saved_block_names):
-                break
-            block_name = saved_block_names[i]
+        try:
+            block_module = get_module(self.model_context.model, block_name)
+        except (AttributeError, KeyError):
+            return
+        if block_module is None:
+            return
 
-            try:
-                block_module = get_module(self.model_context.model, block_name)
-            except (AttributeError, KeyError):
-                continue
-            if block_module is None:
-                continue
+        # Iterate over sub-modules in the block
+        for name, submod in block_module.named_modules():
+            # Build the full layer name relative to the model
+            full_name = f"{block_name}.{name}" if name else block_name
 
-            # Load the correct checkpoint for this specific HF layer
-            ckpt_state = None
+            # Look up config by full path ONLY — no leaf-name fallback.
+            config = layer_config.get(full_name)
+            if config is None:
+                continue
+            # Skip non-quantized layers
             try:
-                ckpt_path = self._checkpoint_block_path(i)
-                if os.path.isfile(ckpt_path):
-                    ckpt_state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                if not check_to_quantized(config):
+                    continue
             except Exception:
-                pass
+                continue
 
-            # Iterate over sub-modules in the block
-            for name, submod in block_module.named_modules():
-                # Build the full layer name relative to the model
-                full_name = f"{block_name}.{name}" if name else block_name
+            # Get bits, group_size, sym, act_bits from config
+            if isinstance(config, dict):
+                bits = config.get("bits", 4)
+                group_size = config.get("group_size", 128)
+                sym = config.get("sym", False)
+                act_bits = config.get("act_bits", 16)
+            else:
+                bits = getattr(config, "bits", 4)
+                group_size = getattr(config, "group_size", 128)
+                sym = getattr(config, "sym", False)
+                act_bits = getattr(config, "act_bits", 16)
 
-                # Look up config by full path ONLY — no leaf-name fallback.
-                config = layer_config.get(full_name)
-                if config is None:
-                    continue
-                # Skip non-quantized layers
-                try:
-                    if not check_to_quantized(config):
-                        continue
-                except Exception:
-                    continue
-
-                # Get bits, group_size, sym, act_bits from config
-                if isinstance(config, dict):
-                    bits = config.get("bits", 4)
-                    group_size = config.get("group_size", 128)
-                    sym = config.get("sym", False)
-                    act_bits = config.get("act_bits", 16)
-                else:
-                    bits = getattr(config, "bits", 4)
-                    group_size = getattr(config, "group_size", 128)
-                    sym = getattr(config, "sym", False)
-                    act_bits = getattr(config, "act_bits", 16)
-
-                # Verify that this sub-module actually has packed weights in the
-                # checkpoint before setting quant attributes.
-                has_packed_in_ckpt = False
-                if ckpt_state is not None:
-                    prefix = f"{name}." if name else ""
-                    for ckpt_key in ckpt_state:
-                        if ckpt_key.startswith(prefix):
-                            suffix = ckpt_key[len(prefix):]
-                            if suffix in ("scales", "qweight", "qzeros"):
-                                has_packed_in_ckpt = True
-                                break
-
-                if not has_packed_in_ckpt:
-                    continue
-
-                # Set quantization config attributes on the module
-                submod.bits = bits
-                submod.group_size = group_size
-                submod.sym = sym
-                submod.act_bits = act_bits
-
-                # Load scale, zp, and packed weight from the checkpoint state dict.
-                if ckpt_state is not None:
-                    prefix = f"{name}." if name else ""
-                    for ckpt_key, ckpt_val in ckpt_state.items():
-                        if ckpt_key.startswith(prefix):
-                            suffix = ckpt_key[len(prefix):]
-                            if suffix == "scales" and not hasattr(submod, "scale"):
-                                # Store scales in checkpoint format (num_groups, out_features).
-                                # pack_layer's has_packed_weights branch will transpose
-                                # when copying to QuantLinear (matching pack_248_bits).
-                                submod.scale = ckpt_val.contiguous().half()
-                            elif suffix == "qzeros" and not hasattr(submod, "zp"):
-                                # Store qzeros in checkpoint format (num_groups, packed_out_features)
-                                submod.zp = ckpt_val.contiguous()
-                            elif suffix == "qweight" and not hasattr(submod, "qweight"):
-                                # Store packed weight on the module for pack_layer()
-                                submod.qweight = ckpt_val
-
+            # Verify that this sub-module actually has packed weights in the
+            # checkpoint before setting quant attributes.
+            has_packed_in_ckpt = False
             if ckpt_state is not None:
-                del ckpt_state
+                prefix = f"{name}." if name else ""
+                for ckpt_key in ckpt_state:
+                    if ckpt_key.startswith(prefix):
+                        suffix = ckpt_key[len(prefix):]
+                        if suffix in ("scales", "qweight", "qzeros"):
+                            has_packed_in_ckpt = True
+                            break
+
+            if not has_packed_in_ckpt:
+                continue
+
+            # Set quantization config attributes on the module
+            submod.bits = bits
+            submod.group_size = group_size
+            submod.sym = sym
+            submod.act_bits = act_bits
+
+            # Load scale, zp, and packed weight from the checkpoint state dict.
+            if ckpt_state is not None:
+                prefix = f"{name}." if name else ""
+                for ckpt_key, ckpt_val in ckpt_state.items():
+                    if ckpt_key.startswith(prefix):
+                        suffix = ckpt_key[len(prefix):]
+                        if suffix == "scales" and not hasattr(submod, "scale"):
+                            # Store scales in checkpoint format (num_groups, out_features).
+                            # pack_layer's has_packed_weights branch will transpose
+                            # when copying to QuantLinear (matching pack_248_bits).
+                            submod.scale = ckpt_val.contiguous().half()
+                        elif suffix == "qzeros" and not hasattr(submod, "zp"):
+                            # Store qzeros in checkpoint format (num_groups, packed_out_features)
+                            submod.zp = ckpt_val.contiguous()
+                        elif suffix == "qweight" and not hasattr(submod, "qweight"):
+                            # Store packed weight on the module for pack_layer()
+                            submod.qweight = ckpt_val
+
+        # Free CPU memory from the checkpoint state dict
+        if ckpt_state is not None:
+            del ckpt_state
+            gc.collect()
 
     def _clear_cache(self) -> None:
         """Remove the .cache checkpoint directory if it exists.
@@ -1386,7 +1381,10 @@ class DataDrivenCompressor(BaseCompressor):
                         block_entry = all_blocks[i]
                         block_name = block_entry[0] if isinstance(block_entry, list) else block_entry
                 if block_name:
-                    self._load_checkpoint_block(i, block_name, self.model_context.model)
+                    # Load checkpoint once and reuse the state dict for
+                    # quant config application (avoids double disk I/O).
+                    ckpt_state = self._load_checkpoint_block(i, block_name, self.model_context.model)
+                    self._apply_quant_config_to_loaded_block(i, block_name, ckpt_state)
                 else:
                     logger.warning(
                         "Cannot resolve block name for index %d, skipping checkpoint load", i
@@ -1415,9 +1413,6 @@ class DataDrivenCompressor(BaseCompressor):
                         total_iters=sm.get("total_iters", 0),
                     )
             logger.info("Completed block loading. Resuming from block %d.", completed)
-
-            # ── Apply quantization config to loaded modules so export works ──
-            self._apply_quant_config_to_loaded_blocks(completed, saved_block_names)
         elif not resume_mode:
             logger.info("Fresh quantization run: no existing checkpoint found.")
 

@@ -419,11 +419,24 @@ class BaseCompressor(object):
     def configure_layer_config(self) -> None:
         """Build ``self.layer_config`` from the resolved scheme on the patched model."""
         predefined_ignore_layers = get_predefined_ignore_layers(self.model_context.model)
-        compressed_predefined_ignore_layers = compress_layer_names(predefined_ignore_layers)
 
+        if predefined_ignore_layers and self.quant_block_list:
+            block_prefixes = [block for group in self.quant_block_list for block in group]
+            # Only filter layers that are full paths clearly inside a block,
+            # or whose top-level module is not a block prefix at all.
+            predefined_ignore_layers = [
+                name
+                for name in predefined_ignore_layers
+                if any(name.startswith(prefix) for prefix in block_prefixes)
+                or not any(prefix.startswith(name.split(".")[0]) for prefix in block_prefixes)
+            ]
         if predefined_ignore_layers:
-            logger.info(f"Using predefined ignore_layers: {compressed_predefined_ignore_layers}")
-            tmp_str = ",".join(predefined_ignore_layers).replace(" ", "")
+            logger.info(f"Using predefined ignore_layers: {compress_layer_names(predefined_ignore_layers)}")
+            # Join the raw (uncompressed) names so that get_fp_layer_names can do exact
+            # substring matching. Compressed forms like "layers.[0-61].gate" are
+            # misinterpreted as regex character classes ([0-6] matches only digits 0-6)
+            # and fail to cover layers with two-digit indices (7, 8, ...).
+            tmp_str = ",".join(predefined_ignore_layers)
             if self.ignore_layers == "":
                 self.ignore_layers = tmp_str
             else:

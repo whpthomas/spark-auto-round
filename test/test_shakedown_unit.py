@@ -106,19 +106,3 @@ class TestShakedownAdjustedSettings:
         assert adjusted_settings["batch_size"] == 1
         assert adjusted_settings["seqlen"] == 2
         assert adjusted_settings["nsamples"] == 1
-
-
-class TestShakedownBanner:
-    """Test shakedown banner is printed correctly."""
-
-    def test_shakedown_banner_contains_override_values(self):
-        """The shakedown banner includes all four override values."""
-        banner = (
-            "SHAKEDOWN MODE — fastest/lowest quality settings\n"
-            "iters=1  nsamples=1  seqlen=2  batch_size=1"
-        )
-        assert "iters=1" in banner
-        assert "nsamples=1" in banner
-        assert "seqlen=2" in banner
-        assert "batch_size=1" in banner
-        assert "SHAKEDOWN MODE" in banner

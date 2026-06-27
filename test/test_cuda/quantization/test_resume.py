@@ -1298,6 +1298,7 @@ class TestHaltAfterNativeIntegration:
             dry_run=False,
             clear_cache=False,
             shakedown=False,
+            offload=False,
             halt_after=halt_after,
             lr=None,
             minmax_lr=None,
@@ -1494,9 +1495,8 @@ class TestHybridArchitectureResumeBug:
                      if not any(k.endswith(s) for s in ('.scales', '.qweight', '.qzeros'))}
         _load_state_dict_into_module(raw_state, model.layers[0])
 
-        # saved_block_names is a flat list of HF layer names from progress.json
-        # Call with completed=1 — this should NOT set bits=4 on block 1's layers
-        compressor._apply_quant_config_to_loaded_blocks(1, ["layers.0"])
+        # Call with block 0 — this should NOT set bits=4 on block 1's layers
+        compressor._apply_quant_config_to_loaded_block(0, "layers.0", ckpt_state)
 
         # Verify: block 0's layers have bits set (they were in checkpoint)
         assert hasattr(model.layers[0].linear_attn.in_proj_qkv, 'bits')
@@ -1570,8 +1570,7 @@ class TestHybridArchitectureResumeBug:
                      if not any(k.endswith(s) for s in ('.scales', '.qweight', '.qzeros'))}
         _load_state_dict_into_module(raw_state, model.layers[0])
 
-        # saved_block_names is a flat list of HF layer names from progress.json
-        compressor._apply_quant_config_to_loaded_blocks(1, ["layers.0"])
+        compressor._apply_quant_config_to_loaded_block(0, "layers.0", ckpt_state)
 
         # linear_attn.in_proj_qkv should have bits set (it was in checkpoint)
         assert hasattr(model.layers[0].linear_attn.in_proj_qkv, 'bits')
