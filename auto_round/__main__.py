@@ -68,6 +68,7 @@ class BasicArgumentParser(argparse.ArgumentParser):
             help="Calibration dataset. Available: opencode-instruct, github-code-clean, "
                  "pile-10k, pile-val-backup, CCI3-HQ, ultrachat_200k, "
                  "openbmb/Ultra-FineWeb, new-title-chinese, mbpp, audiocaps, "
+                 "cuad, finqa, legalbench, legalbench-instruct, "
                  "local (loads from local directory)."
         )
         basic.add_argument(
@@ -492,7 +493,7 @@ def tune(args):
         if args.halt_after >= 0:
             # --halt-after simulates Ctrl+C; exit cleanly
             logger.info("--halt-after: exiting cleanly. Resume by re-running without --halt-after.")
-            return
+            raise  # re-raise so callers (tests) can detect simulated interrupt
         raise
     tokenizer = autoround.tokenizer
     clear_memory()

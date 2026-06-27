@@ -876,6 +876,455 @@ def get_local_dataset(
     return calib_dataset
 
 
+@register_dataset(["whpthomas/cuad-parquet", "cuad"])
+def get_cuad_dataset(
+    tokenizer,
+    seqlen,
+    dataset_name="whpthomas/cuad-parquet",
+    split=None,
+    seed=42,
+    apply_chat_template=False,
+    system_prompt=None,
+):
+    """Returns a tokenized dataset for CUAD (contract QA).
+
+    Flattens the nested CUAD structure into a single text field
+    (context + question), downloads parquet shards from HF, tokenizes,
+    and packs short sequences to fill seqlen.
+
+    Args:
+        tokenizer: The tokenizer to use for tokenization.
+        seqlen: The maximum sequence length.
+        dataset_name: The name of the dataset (default: "whpthomas/cuad-parquet").
+        split: Unused (all data is in a single split).
+        seed: The random seed for shuffling.
+        apply_chat_template: Whether to apply chat template in tokenization.
+        system_prompt: Optional system prompt for chat template.
+
+    Returns:
+        A tokenized HuggingFace Dataset for calibration.
+    """
+    import random
+
+    from huggingface_hub import HfApi, hf_hub_download
+
+    full_dataset_name = "whpthomas/cuad-parquet"
+
+    tokenizer_function = get_tokenizer_function(
+        tokenizer, seqlen, apply_chat_template=apply_chat_template, system_prompt=system_prompt
+    )
+
+    # List all parquet files in the repository
+    api = HfApi()
+    files = api.list_repo_files(full_dataset_name, repo_type="dataset")
+    parquet_files = sorted([f for f in files if f.endswith(".parquet")])
+
+    # Sample random shards for diversity
+    # CUAD texts are long (median ~34K chars), so most fill seqlen on their own.
+    # Still take enough shards to get good coverage.
+    target_samples = 2000
+    num_shards = min(len(parquet_files), max(1, target_samples // 500))
+    random.seed(seed)
+    selected_shards = random.sample(parquet_files, min(num_shards, len(parquet_files)))
+
+    logger.debug(f"Loading {len(selected_shards)} shards from {full_dataset_name}")
+
+    # Download and load parquet files
+    dfs = []
+    for shard in selected_shards:
+        path = hf_hub_download(full_dataset_name, shard, repo_type="dataset")
+        df = pd.read_parquet(path)
+        dfs.append(df)
+
+    # Combine into a single dataset
+    combined_df = pd.concat(dfs, ignore_index=True)
+    del dfs
+    calib_dataset = Dataset.from_pandas(combined_df)
+    del combined_df
+
+    # Shuffle and take samples
+    calib_dataset = calib_dataset.shuffle(seed=seed).select(range(min(target_samples, len(calib_dataset))))
+
+    # Tokenize with caching support
+    calib_dataset = calib_dataset.map(
+        tokenizer_function,
+        batched=True,
+        new_fingerprint=_make_map_fingerprint(
+            calib_dataset, tokenizer, seqlen, apply_chat_template, system_prompt, "text"
+        ),
+    )
+
+    # Pack short sequences: concatenate multiple samples to fill seqlen
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        eos_token_id = tokenizer.pad_token_id
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_token_id
+
+    packed_input_ids = []
+    packed_attention_mask = []
+    current_ids = []
+
+    def _finalize_sequence(seq):
+        if not seq:
+            return
+        seq = seq[:seqlen]
+        attention_mask = [1] * seqlen
+        seq = seq + [pad_token_id] * (seqlen - len(seq))
+        packed_input_ids.append(seq)
+        packed_attention_mask.append(attention_mask)
+
+    for example in calib_dataset:
+        ids = example["input_ids"]
+        if isinstance(ids, list):
+            ids = torch.tensor(ids)
+        if len(ids) == 0:
+            continue
+        ids_list = ids.tolist()
+        if len(ids_list) >= seqlen:
+            if current_ids:
+                _finalize_sequence(current_ids)
+                current_ids = []
+            _finalize_sequence(ids_list)
+            continue
+        extra = 1 if current_ids else 0
+        if len(current_ids) + extra + len(ids_list) <= seqlen:
+            if current_ids:
+                current_ids.append(eos_token_id)
+            current_ids.extend(ids_list)
+        else:
+            if current_ids:
+                _finalize_sequence(current_ids)
+            current_ids = list(ids_list)
+
+    _finalize_sequence(current_ids)
+
+    data = [{"input_ids": ids, "attention_mask": mask} for ids, mask in zip(packed_input_ids, packed_attention_mask)]
+    del packed_input_ids, packed_attention_mask
+    calib_dataset = Dataset.from_list(data)
+
+    return calib_dataset
+
+
+@register_dataset(["whpthomas/finqa-parquet", "finqa"])
+def get_finqa_dataset(
+    tokenizer,
+    seqlen,
+    dataset_name="whpthomas/finqa-parquet",
+    split=None,
+    seed=42,
+    apply_chat_template=False,
+    system_prompt=None,
+):
+    """Returns a tokenized dataset for FinQA (financial QA).
+
+    Downloads parquet shards from the modernized HF repo, tokenizes,
+    and packs short sequences to fill seqlen.
+
+    Args:
+        tokenizer: The tokenizer to use for tokenization.
+        seqlen: The maximum sequence length.
+        dataset_name: The name of the dataset (default: "whpthomas/finqa-parquet").
+        split: Unused (all data is in a single split).
+        seed: The random seed for shuffling.
+        apply_chat_template: Whether to apply chat template in tokenization.
+        system_prompt: Optional system prompt for chat template.
+
+    Returns:
+        A tokenized HuggingFace Dataset for calibration.
+    """
+    import random
+
+    from huggingface_hub import HfApi, hf_hub_download
+
+    full_dataset_name = "whpthomas/finqa-parquet"
+
+    tokenizer_function = get_tokenizer_function(
+        tokenizer, seqlen, apply_chat_template=apply_chat_template, system_prompt=system_prompt
+    )
+
+    # List all parquet files in the repository
+    api = HfApi()
+    files = api.list_repo_files(full_dataset_name, repo_type="dataset")
+    parquet_files = sorted([f for f in files if f.endswith(".parquet")])
+
+    # Sample random shards for diversity
+    target_samples = 2000
+    num_shards = min(len(parquet_files), max(1, target_samples // 500))
+    random.seed(seed)
+    selected_shards = random.sample(parquet_files, min(num_shards, len(parquet_files)))
+
+    logger.debug(f"Loading {len(selected_shards)} shards from {full_dataset_name}")
+
+    # Download and load parquet files
+    dfs = []
+    for shard in selected_shards:
+        path = hf_hub_download(full_dataset_name, shard, repo_type="dataset")
+        df = pd.read_parquet(path)
+        dfs.append(df)
+
+    # Combine into a single dataset
+    combined_df = pd.concat(dfs, ignore_index=True)
+    del dfs
+    calib_dataset = Dataset.from_pandas(combined_df)
+    del combined_df
+
+    # Shuffle and take samples
+    calib_dataset = calib_dataset.shuffle(seed=seed).select(range(min(target_samples, len(calib_dataset))))
+
+    # Tokenize with caching support
+    calib_dataset = calib_dataset.map(
+        tokenizer_function,
+        batched=True,
+        new_fingerprint=_make_map_fingerprint(
+            calib_dataset, tokenizer, seqlen, apply_chat_template, system_prompt, "text"
+        ),
+    )
+
+    # Pack short sequences: concatenate multiple samples to fill seqlen
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        eos_token_id = tokenizer.pad_token_id
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_token_id
+
+    packed_input_ids = []
+    packed_attention_mask = []
+    current_ids = []
+
+    def _finalize_sequence(seq):
+        if not seq:
+            return
+        seq = seq[:seqlen]
+        attention_mask = [1] * seqlen
+        seq = seq + [pad_token_id] * (seqlen - len(seq))
+        packed_input_ids.append(seq)
+        packed_attention_mask.append(attention_mask)
+
+    for example in calib_dataset:
+        ids = example["input_ids"]
+        if isinstance(ids, list):
+            ids = torch.tensor(ids)
+        if len(ids) == 0:
+            continue
+        ids_list = ids.tolist()
+        if len(ids_list) >= seqlen:
+            if current_ids:
+                _finalize_sequence(current_ids)
+                current_ids = []
+            _finalize_sequence(ids_list)
+            continue
+        extra = 1 if current_ids else 0
+        if len(current_ids) + extra + len(ids_list) <= seqlen:
+            if current_ids:
+                current_ids.append(eos_token_id)
+            current_ids.extend(ids_list)
+        else:
+            if current_ids:
+                _finalize_sequence(current_ids)
+            current_ids = list(ids_list)
+
+    _finalize_sequence(current_ids)
+
+    data = [{"input_ids": ids, "attention_mask": mask} for ids, mask in zip(packed_input_ids, packed_attention_mask)]
+    del packed_input_ids, packed_attention_mask
+    calib_dataset = Dataset.from_list(data)
+
+    return calib_dataset
+
+
+@register_dataset(["nguha/legalbench", "legalbench"])
+def get_legalbench_dataset(
+    tokenizer,
+    seqlen,
+    dataset_name="nguha/legalbench",
+    split=None,
+    seed=42,
+    apply_chat_template=False,
+    system_prompt=None,
+):
+    """Returns a tokenized dataset for LegalBench.
+
+    LegalBench contains short trademark/legal phrase classification examples.
+    Uses the test split (95 samples) for calibration.
+
+    Args:
+        tokenizer: The tokenizer to use for tokenization.
+        seqlen: The maximum sequence length.
+        dataset_name: The name of the dataset (default: "nguha/legalbench").
+        split: Unused (test split is always used).
+        seed: The random seed for shuffling.
+        apply_chat_template: Whether to apply chat template in tokenization.
+        system_prompt: Optional system prompt for chat template.
+
+    Returns:
+        A tokenized HuggingFace Dataset for calibration.
+    """
+    from datasets import load_dataset
+
+    tokenizer_function = get_tokenizer_function(
+        tokenizer, seqlen, apply_chat_template=apply_chat_template, system_prompt=system_prompt
+    )
+
+    # Use test split (95 samples, more useful than 5 train samples)
+    calib_dataset = load_dataset("nguha/legalbench", split="test")
+    calib_dataset = calib_dataset.shuffle(seed=seed)
+    calib_dataset = calib_dataset.map(
+        tokenizer_function,
+        batched=True,
+        new_fingerprint=_make_map_fingerprint(
+            calib_dataset, tokenizer, seqlen, apply_chat_template, system_prompt, "text"
+        ),
+    )
+
+    return calib_dataset
+
+
+@register_dataset(["legalbench-instruct"])
+def get_legalbench_padded_dataset(
+    tokenizer,
+    seqlen,
+    dataset_name="legalbench-instruct",
+    split=None,
+    seed=42,
+    apply_chat_template=False,
+    system_prompt=None,
+):
+    """Returns a tokenized dataset for LegalBench padded with OpenCode Instruct.
+
+    LegalBench has only 95 samples, which is below the default nsamples=512.
+    This variant combines all 95 LegalBench samples with ~417 samples from
+    OpenCode Instruct (packed) to reach ~512 total, giving better coverage
+    for models that will be used on both legal and coding tasks.
+
+    Args:
+        tokenizer: The tokenizer to use for tokenization.
+        seqlen: The maximum sequence length.
+        dataset_name: The name of the dataset (default: "legalbench-instruct").
+        split: Unused.
+        seed: The random seed for shuffling.
+        apply_chat_template: Whether to apply chat template in tokenization.
+        system_prompt: Optional system prompt for chat template.
+
+    Returns:
+        A tokenized HuggingFace Dataset for calibration.
+    """
+    import random
+
+    from datasets import concatenate_datasets, load_dataset
+
+    tokenizer_function = get_tokenizer_function(
+        tokenizer, seqlen, apply_chat_template=apply_chat_template, system_prompt=system_prompt
+    )
+
+    # --- 1. Load all 95 LegalBench samples ---
+    legal_ds = load_dataset("nguha/legalbench", split="test")
+    legal_ds = legal_ds.shuffle(seed=seed)
+    legal_ds = legal_ds.map(
+        tokenizer_function,
+        batched=True,
+        new_fingerprint=_make_map_fingerprint(
+            legal_ds, tokenizer, seqlen, apply_chat_template, system_prompt, "text"
+        ),
+    )
+    logger.info(f"legalbench-instruct: {len(legal_ds)} samples from legalbench")
+
+    # --- 2. Load ~417 samples from OpenCode Instruct (packed) ---
+    from huggingface_hub import HfApi, hf_hub_download
+
+    full_dataset_name = "nvidia/OpenCodeInstruct"
+    api = HfApi()
+    files = api.list_repo_files(full_dataset_name, repo_type="dataset")
+    parquet_files = sorted([f for f in files if f.endswith(".parquet") and f.startswith("data/")])
+
+    opencode_target = 512 - len(legal_ds)  # ~417
+    num_shards = min(2, len(parquet_files))
+    random.seed(seed)
+    selected_shards = random.sample(parquet_files, num_shards)
+
+    dfs = []
+    for shard in selected_shards:
+        path = hf_hub_download(full_dataset_name, shard, repo_type="dataset")
+        df = pd.read_parquet(path)
+        dfs.append(df)
+
+    combined_df = pd.concat(dfs, ignore_index=True)
+    del dfs
+    opencode_ds = Dataset.from_pandas(combined_df)
+    del combined_df
+
+    # Concatenate input + output into a single text field
+    def concat_function(examples):
+        examples["text"] = [inp + "\n" + out for inp, out in zip(examples["input"], examples["output"])]
+        return examples
+
+    opencode_ds = opencode_ds.map(concat_function, batched=True)
+    opencode_ds = opencode_ds.shuffle(seed=seed).select(range(min(opencode_target, len(opencode_ds))))
+
+    # Tokenize
+    opencode_ds = opencode_ds.map(
+        tokenizer_function,
+        batched=True,
+        new_fingerprint=_make_map_fingerprint(
+            opencode_ds, tokenizer, seqlen, apply_chat_template, system_prompt, "text"
+        ),
+    )
+
+    # Pack short sequences
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        eos_token_id = tokenizer.pad_token_id
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_token_id
+
+    packed_input_ids = []
+    packed_attention_mask = []
+    current_ids = []
+
+    def _finalize_sequence(seq):
+        if not seq:
+            return
+        seq = seq[:seqlen]
+        attention_mask = [1] * seqlen
+        seq = seq + [pad_token_id] * (seqlen - len(seq))
+        packed_input_ids.append(seq)
+        packed_attention_mask.append(attention_mask)
+
+    for example in opencode_ds:
+        ids = example["input_ids"]
+        if isinstance(ids, list):
+            ids = torch.tensor(ids)
+        if len(ids) == 0:
+            continue
+        ids_list = ids.tolist()
+        if len(ids_list) >= seqlen:
+            if current_ids:
+                _finalize_sequence(current_ids)
+                current_ids = []
+            _finalize_sequence(ids_list)
+            continue
+        extra = 1 if current_ids else 0
+        if len(current_ids) + extra + len(ids_list) <= seqlen:
+            if current_ids:
+                current_ids.append(eos_token_id)
+            current_ids.extend(ids_list)
+        else:
+            if current_ids:
+                _finalize_sequence(current_ids)
+            current_ids = list(ids_list)
+
+    _finalize_sequence(current_ids)
+
+    data = [{"input_ids": ids, "attention_mask": mask} for ids, mask in zip(packed_input_ids, packed_attention_mask)]
+    del packed_input_ids, packed_attention_mask
+    opencode_ds = Dataset.from_list(data)
+    logger.info(f"legalbench-instruct: {len(opencode_ds)} samples from opencode-instruct")
+
+    # --- 3. Combine and shuffle ---
+    final_ds = concatenate_datasets([legal_ds, opencode_ds])
+    final_ds = final_ds.shuffle(seed=seed)
+    logger.info(f"legalbench-instruct: {len(final_ds)} total samples")
+
+    return final_ds
+
+
 def get_dataset_len(dataset):
     """Calculates the length of a dataset.
 

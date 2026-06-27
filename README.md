@@ -47,7 +47,7 @@ To run comparative benchmarks and compare and contrast quantized models we need 
 - **Memory-Aware Auto-Tuner**: Pre-flight peak memory estimation automatically adjusts `--batch_size`, `--seqlen`, and `--nsamples` when the per-block peak exceeds the `--max_model_mem` ceiling. Relaxes the least quality-damaging setting first.
 - **Stateful Resume**: If quantization is interrupted (Ctrl-C) or crashes (OOM), re-running the same command resumes from the last completed block. On OOM resume the auto-tuner tightens its budget to avoid re-crashing.
 - **torch.compile**: Always enabled for faster quantization on CUDA
-- **New Datasets** including OpenCode Instruct and updated Github Code Clean
+- **New Datasets** including OpenCode Instruct, CUAD, FinQA, LegalBench, and updated Github Code Clean
 - **Adaptive Sensitivity-Aware Quantization**: A companion tool that replaces sensitive layers with fp16 layers from the original model.
 
 ## Installation
@@ -282,8 +282,12 @@ On successful completion, `.cache/` is automatically cleaned up. To force a fres
 | [mbpp](https://huggingface.co/datasets/google-research-datasets/mbpp) | Python problems + code | Text + code concatenated |
 | [AudioCaps](https://github.com/cdjkim/audiocaps) | Sound/music captions | Good for audio-related models |
 | [new-title-chinese](https://huggingface.co/datasets/madao33/new-title-chinese) | Chinese news headlines | For Chinese NLP tasks |
+| [cuad](https://huggingface.co/datasets/whpthomas/cuad-parquet) | Legal contract QA | Context + question; packs short sequences |
+| [finqa](https://huggingface.co/datasets/whpthomas/finqa-parquet) | Financial QA | Pre-text + question + post-text; packs short sequences |
+| [legalbench](https://huggingface.co/datasets/nguha/legalbench) | Trademark classification | Short legal phrases; test split (95 samples) |
+| [legalbench-instruct](https://huggingface.co/datasets/nguha/legalbench) | LegalBench + OpenCode Instruct | 95 legal + ~416 code = ~511 total; balanced coverage |
 
-**Tip:** Use `opencode-instruct` for coding models and `pile-10k` or `CCI3-HQ` for general-purpose models.
+**Tip:** Use `opencode-instruct` for coding models and `pile-10k` or `CCI3-HQ` for general-purpose models. Use `cuad` or `finqa` for domain-specific legal/financial calibration.
 
 ## Supported Format
 
